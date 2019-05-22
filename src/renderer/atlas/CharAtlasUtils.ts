@@ -4,19 +4,24 @@
  */
 
 import { ITerminal } from '../../Types';
-import { IColorSet } from '../Types';
-import { ICharAtlasConfig } from '../../shared/atlas/Types';
+import { ICharAtlasConfig } from './Types';
+import { DEFAULT_COLOR } from '../../common/Types';
+import { IColorSet } from '../../ui/Types';
 
 export function generateConfig(scaledCharWidth: number, scaledCharHeight: number, terminal: ITerminal, colors: IColorSet): ICharAtlasConfig {
-  const clonedColors = {
+  // null out some fields that don't matter
+  const clonedColors = <IColorSet>{
     foreground: colors.foreground,
     background: colors.background,
     cursor: null,
     cursorAccent: null,
     selection: null,
+    // For the static char atlas, we only use the first 16 colors, but we need all 256 for the
+    // dynamic character atlas.
     ansi: colors.ansi.slice(0, 16)
   };
   return {
+    type: terminal.options.experimentalCharAtlas,
     devicePixelRatio: window.devicePixelRatio,
     scaledCharWidth,
     scaledCharHeight,
@@ -35,7 +40,8 @@ export function configEquals(a: ICharAtlasConfig, b: ICharAtlasConfig): boolean 
       return false;
     }
   }
-  return a.devicePixelRatio === b.devicePixelRatio &&
+  return a.type === b.type &&
+      a.devicePixelRatio === b.devicePixelRatio &&
       a.fontFamily === b.fontFamily &&
       a.fontSize === b.fontSize &&
       a.fontWeight === b.fontWeight &&
@@ -45,4 +51,8 @@ export function configEquals(a: ICharAtlasConfig, b: ICharAtlasConfig): boolean 
       a.scaledCharHeight === b.scaledCharHeight &&
       a.colors.foreground === b.colors.foreground &&
       a.colors.background === b.colors.background;
+}
+
+export function is256Color(colorCode: number): boolean {
+  return colorCode < DEFAULT_COLOR;
 }

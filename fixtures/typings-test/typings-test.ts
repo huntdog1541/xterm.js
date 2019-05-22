@@ -4,7 +4,7 @@
 
 /// <reference path="../../typings/xterm.d.ts" />
 
-import { Terminal } from 'xterm';
+import { Terminal, IDisposable } from 'xterm';
 
 namespace constructor {
   {
@@ -21,7 +21,7 @@ namespace constructor {
       'disableStdin': false,
       'rows': 1,
       'scrollback': 10,
-      'tabStopWidth': 2,
+      'tabStopWidth': 2
     });
   }
 }
@@ -119,6 +119,12 @@ namespace methods_core {
     const t: Terminal = new Terminal();
     t.attachCustomKeyEventHandler((e: KeyboardEvent) => true);
     t.attachCustomKeyEventHandler((e: KeyboardEvent) => false);
+    const d1: IDisposable = t.addCsiHandler('x',
+       (params: number[], collect: string): boolean => params[0] === 1);
+    d1.dispose();
+    const d2: IDisposable = t.addOscHandler(199,
+       (data: string): boolean => true);
+    d2.dispose();
   }
   namespace options {
     {
@@ -149,6 +155,7 @@ namespace methods_core {
       const r25: string = t.getOption('fontWeightBold');
       const r26: boolean = t.getOption('allowTransparency');
       const r27: boolean = t.getOption('rightClickSelectsWord');
+      const r28: boolean = t.getOption('windowsMode');
     }
     {
       const t: Terminal = new Terminal();
@@ -171,6 +178,7 @@ namespace methods_core {
       t.setOption('useFlowControl', true);
       t.setOption('allowTransparency', true);
       t.setOption('visualBell', true);
+      t.setOption('windowsMode', true);
       t.setOption('colors', ['a', 'b']);
       t.setOption('letterSpacing', 1);
       t.setOption('cols', 1);

@@ -7,7 +7,7 @@ import { assert } from 'chai';
 import { ITerminal } from './Types';
 import { SelectionModel } from './SelectionModel';
 import { BufferSet } from './BufferSet';
-import { MockTerminal } from './utils/TestUtils.test';
+import { MockTerminal } from './TestUtils.test';
 
 class TestSelectionModel extends SelectionModel {
   constructor(
@@ -23,8 +23,8 @@ describe('SelectionManager', () => {
 
   beforeEach(() => {
     terminal = new MockTerminal();
-    terminal.cols = 80;
-    terminal.rows = 2;
+    (terminal as any).cols = 80;
+    (terminal as any).rows = 2;
     terminal.options.scrollback = 10;
     terminal.buffers = new BufferSet(terminal);
     terminal.buffer = terminal.buffers.active;
@@ -127,6 +127,11 @@ describe('SelectionManager', () => {
       model.selectionStartLength = 2;
       model.selectionEnd = [3, 2];
       assert.deepEqual(model.finalSelectionEnd, [4, 2]);
+    });
+    it('should return the end on a different row when start + length overflows onto a following row', () => {
+      model.selectionStart = [78, 2];
+      model.selectionStartLength = 4;
+      assert.deepEqual(model.finalSelectionEnd, [2, 3]);
     });
     it('should return selection end if selection end is after selection start + length', () => {
       model.selectionStart = [2, 2];

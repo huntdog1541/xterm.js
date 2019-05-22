@@ -23,34 +23,32 @@ opening an issue, read these pointers.
 - Mention precisely what went wrong. What did you expect to happen? What happened instead? Describe the
   exact steps a maintainer has to take to make the problem occur.
 
-- If the problem can not be reproduced in the [demo of xterm.js](README.md#demo), please provide an HTML document that demonstrates the problem.
+- If the problem can not be reproduced in the [demo of xterm.js](https://github.com/xtermjs/xterm.js/wiki/Contributing#running-the-demo), please provide an HTML document that demonstrates the problem.
 
 - Be polite. Issues with an indignant or belligerent tone tend to be moved to the
   bottom of the pile.
 
 ## Contributing code
 
-- Make sure you have a [GitHub account](https://github.com/join)
+You can find issues to work on by looking at the [help wanted](https://github.com/xtermjs/xterm.js/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22) or [good first issue](https://github.com/xtermjs/xterm.js/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) issues. It's a good idea to comment on the issue saying that you're taking it, just in case someone else comes along and you duplicate work. Once you have your issue, here are the steps to contribute:
+
 - Fork [xterm.js](https://github.com/sourcelair/xterm.js/)
-  ([how to fork a repo](https://help.github.com/articles/fork-a-repo))
-- Make your changes
+  ([how to fork a repo](https://help.github.com/articles/fork-a-repo)).
+- Get the [xterm.js demo](https://github.com/xtermjs/xterm.js/wiki/Contributing#running-the-demo) running.
+- Make your changes.
 - If your changes are easy to test or likely to regress, add tests. Tests go into `test`, directory.
 - Follow the general code style of the rest of the project (see below).
 - Submit a pull request
 ([how to create a pull request](https://help.github.com/articles/fork-a-repo)).
   Don't put more than one feature/fix in a single pull request.
 
-By contributing code to xterm.js you
+By contributing code to xterm.js you:
 
- - agree to license the contributed code under xterm.js' [MIT
+ - Agree to license the contributed code under xterm.js' [MIT
    license](LICENSE).
 
- - confirm that you have the right to contribute and license the code
+ - Confirm that you have the right to contribute and license the code
    in question. (Either you hold all rights on the code, or the rights
    holder has explicitly granted the right to use it like this,
    through a compatible open source license or through a direct
    agreement with you.)
-
-### Third party dependencies
-
-We prefer to not include any non-dev third party dependencies in order to keep our code minimal, performant and secure. If you plan on adding a dependency on a third party library it's a good idea to discuss the need in an issue with the maintainers first.

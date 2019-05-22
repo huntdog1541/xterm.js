@@ -4,12 +4,95 @@
  * @license MIT
  */
 
-import { CharData, IInputHandler, IInputHandlingTerminal } from './Types';
-import { C0 } from './EscapeSequences';
-import { DEFAULT_CHARSET } from './Charsets';
-import { CHAR_DATA_CHAR_INDEX, CHAR_DATA_WIDTH_INDEX } from './Buffer';
-import { FLAGS } from './renderer/Types';
+import { IInputHandler, IDcsHandler, IEscapeSequenceParser, IInputHandlingTerminal } from './Types';
+import { C0, C1 } from './common/data/EscapeSequences';
+import { CHARSETS, DEFAULT_CHARSET } from './core/data/Charsets';
 import { wcwidth } from './CharWidth';
+import { EscapeSequenceParser } from './EscapeSequenceParser';
+import { IDisposable } from 'xterm';
+import { Disposable } from './common/Lifecycle';
+import { concat } from './common/TypedArrayUtils';
+import { StringToUtf32, stringFromCodePoint, utf32ToString, Utf8ToUtf32 } from './core/input/TextDecoder';
+import { CellData, Attributes, FgFlags, BgFlags, AttributeData, NULL_CELL_WIDTH, NULL_CELL_CODE, DEFAULT_ATTR_DATA } from './core/buffer/BufferLine';
+import { EventEmitter2, IEvent } from './common/EventEmitter2';
+
+/**
+ * Map collect to glevel. Used in `selectCharset`.
+ */
+const GLEVEL: {[key: string]: number} = {'(': 0, ')': 1, '*': 2, '+': 3, '-': 1, '.': 2};
+
+
+/**
+ * DCS subparser implementations
+ */
+
+/**
+ * DCS $ q Pt ST
+ *   DECRQSS (https://vt100.net/docs/vt510-rm/DECRQSS.html)
+ *   Request Status String (DECRQSS), VT420 and up.
+ *   Response: DECRPSS (https://vt100.net/docs/vt510-rm/DECRPSS.html)
+ */
+class DECRQSS implements IDcsHandler {
+  private _data: Uint32Array = new Uint32Array(0);
+
+  constructor(private _terminal: any) { }
+
+  hook(collect: string, params: number[], flag: number): void {
+    this._data = new Uint32Array(0);
+  }
+
+  put(data: Uint32Array, start: number, end: number): void {
+    this._data = concat(this._data, data.subarray(start, end));
+  }
+
+  unhook(): void {
+    const data = utf32ToString(this._data);
+    this._data = new Uint32Array(0);
+    switch (data) {
+      // valid: DCS 1 $ r Pt ST (xterm)
+      case '"q': // DECSCA
+        return this._terminal.handler(`${C0.ESC}P1$r0"q${C0.ESC}\\`);
+      case '"p': // DECSCL
+        return this._terminal.handler(`${C0.ESC}P1$r61"p${C0.ESC}\\`);
+      case 'r': // DECSTBM
+        const pt = '' + (this._terminal.buffer.scrollTop + 1) +
+                ';' + (this._terminal.buffer.scrollBottom + 1) + 'r';
+        return this._terminal.handler(`${C0.ESC}P1$r${pt}${C0.ESC}\\`);
+      case 'm': // SGR
+        // TODO: report real settings instead of 0m
+        return this._terminal.handler(`${C0.ESC}P1$r0m${C0.ESC}\\`);
+      case ' q': // DECSCUSR
+        const STYLES: {[key: string]: number} = {'block': 2, 'underline': 4, 'bar': 6};
+        let style = STYLES[this._terminal.getOption('cursorStyle')];
+        style -= this._terminal.getOption('cursorBlink');
+        return this._terminal.handler(`${C0.ESC}P1$r${style} q${C0.ESC}\\`);
+      default:
+        // invalid: DCS 0 $ r Pt ST (xterm)
+        this._terminal.error('Unknown DCS $q %s', data);
+        this._terminal.handler(`${C0.ESC}P0$r${C0.ESC}\\`);
+    }
+  }
+}
+
+/**
+ * DCS Ps; Ps| Pt ST
+ *   DECUDK (https://vt100.net/docs/vt510-rm/DECUDK.html)
+ *   not supported
+ */
+
+/**
+ * DCS + q Pt ST (xterm)
+ *   Request Terminfo String
+ *   not implemented
+ */
+
+/**
+ * DCS + p Pt ST (xterm)
+ *   Set Terminfo Data
+ *   not supported
+ */
+
+
 
 /**
  * The terminal's standard implementation of IInputHandler, this handles all
@@ -18,54 +101,310 @@ import { wcwidth } from './CharWidth';
  * Refer to http://invisible-island.net/xterm/ctlseqs/ctlseqs.html to understand
  * each function's header comment.
  */
-export class InputHandler implements IInputHandler {
-  constructor(private _terminal: IInputHandlingTerminal) { }
+export class InputHandler extends Disposable implements IInputHandler {
+  private _parseBuffer: Uint32Array = new Uint32Array(4096);
+  private _stringDecoder: StringToUtf32 = new StringToUtf32();
+  private _utf8Decoder: Utf8ToUtf32 = new Utf8ToUtf32();
+  private _workCell: CellData = new CellData();
 
-  public addChar(char: string, code: number): void {
-    if (char >= ' ') {
+  private _onCursorMove = new EventEmitter2<void>();
+  public get onCursorMove(): IEvent<void> { return this._onCursorMove.event; }
+  private _onData = new EventEmitter2<string>();
+  public get onData(): IEvent<string> { return this._onData.event; }
+  private _onLineFeed = new EventEmitter2<void>();
+  public get onLineFeed(): IEvent<void> { return this._onLineFeed.event; }
+  private _onScroll = new EventEmitter2<number>();
+  public get onScroll(): IEvent<number> { return this._onScroll.event; }
 
-      // make buffer local for faster access
-      const buffer = this._terminal.buffer;
+  constructor(
+      protected _terminal: IInputHandlingTerminal,
+      private _parser: IEscapeSequenceParser = new EscapeSequenceParser())
+  {
+    super();
+
+    this.register(this._parser);
+
+    /**
+     * custom fallback handlers
+     */
+    this._parser.setCsiHandlerFallback((collect: string, params: number[], flag: number) => {
+      this._terminal.error('Unknown CSI code: ', { collect, params, flag: String.fromCharCode(flag) });
+    });
+    this._parser.setEscHandlerFallback((collect: string, flag: number) => {
+      this._terminal.error('Unknown ESC code: ', { collect, flag: String.fromCharCode(flag) });
+    });
+    this._parser.setExecuteHandlerFallback((code: number) => {
+      this._terminal.error('Unknown EXECUTE code: ', { code });
+    });
+    this._parser.setOscHandlerFallback((identifier: number, data: string) => {
+      this._terminal.error('Unknown OSC code: ', { identifier, data });
+    });
+
+    /**
+     * print handler
+     */
+    this._parser.setPrintHandler((data, start, end): void => this.print(data, start, end));
+
+    /**
+     * CSI handler
+     */
+    this._parser.setCsiHandler('@', (params, collect) => this.insertChars(params));
+    this._parser.setCsiHandler('A', (params, collect) => this.cursorUp(params));
+    this._parser.setCsiHandler('B', (params, collect) => this.cursorDown(params));
+    this._parser.setCsiHandler('C', (params, collect) => this.cursorForward(params));
+    this._parser.setCsiHandler('D', (params, collect) => this.cursorBackward(params));
+    this._parser.setCsiHandler('E', (params, collect) => this.cursorNextLine(params));
+    this._parser.setCsiHandler('F', (params, collect) => this.cursorPrecedingLine(params));
+    this._parser.setCsiHandler('G', (params, collect) => this.cursorCharAbsolute(params));
+    this._parser.setCsiHandler('H', (params, collect) => this.cursorPosition(params));
+    this._parser.setCsiHandler('I', (params, collect) => this.cursorForwardTab(params));
+    this._parser.setCsiHandler('J', (params, collect) => this.eraseInDisplay(params));
+    this._parser.setCsiHandler('K', (params, collect) => this.eraseInLine(params));
+    this._parser.setCsiHandler('L', (params, collect) => this.insertLines(params));
+    this._parser.setCsiHandler('M', (params, collect) => this.deleteLines(params));
+    this._parser.setCsiHandler('P', (params, collect) => this.deleteChars(params));
+    this._parser.setCsiHandler('S', (params, collect) => this.scrollUp(params));
+    this._parser.setCsiHandler('T', (params, collect) => this.scrollDown(params, collect));
+    this._parser.setCsiHandler('X', (params, collect) => this.eraseChars(params));
+    this._parser.setCsiHandler('Z', (params, collect) => this.cursorBackwardTab(params));
+    this._parser.setCsiHandler('`', (params, collect) => this.charPosAbsolute(params));
+    this._parser.setCsiHandler('a', (params, collect) => this.hPositionRelative(params));
+    this._parser.setCsiHandler('b', (params, collect) => this.repeatPrecedingCharacter(params));
+    this._parser.setCsiHandler('c', (params, collect) => this.sendDeviceAttributes(params, collect));
+    this._parser.setCsiHandler('d', (params, collect) => this.linePosAbsolute(params));
+    this._parser.setCsiHandler('e', (params, collect) => this.vPositionRelative(params));
+    this._parser.setCsiHandler('f', (params, collect) => this.hVPosition(params));
+    this._parser.setCsiHandler('g', (params, collect) => this.tabClear(params));
+    this._parser.setCsiHandler('h', (params, collect) => this.setMode(params, collect));
+    this._parser.setCsiHandler('l', (params, collect) => this.resetMode(params, collect));
+    this._parser.setCsiHandler('m', (params, collect) => this.charAttributes(params));
+    this._parser.setCsiHandler('n', (params, collect) => this.deviceStatus(params, collect));
+    this._parser.setCsiHandler('p', (params, collect) => this.softReset(params, collect));
+    this._parser.setCsiHandler('q', (params, collect) => this.setCursorStyle(params, collect));
+    this._parser.setCsiHandler('r', (params, collect) => this.setScrollRegion(params, collect));
+    this._parser.setCsiHandler('s', (params, collect) => this.saveCursor(params));
+    this._parser.setCsiHandler('u', (params, collect) => this.restoreCursor(params));
+
+    /**
+     * execute handler
+     */
+    this._parser.setExecuteHandler(C0.BEL, () => this.bell());
+    this._parser.setExecuteHandler(C0.LF, () => this.lineFeed());
+    this._parser.setExecuteHandler(C0.VT, () => this.lineFeed());
+    this._parser.setExecuteHandler(C0.FF, () => this.lineFeed());
+    this._parser.setExecuteHandler(C0.CR, () => this.carriageReturn());
+    this._parser.setExecuteHandler(C0.BS, () => this.backspace());
+    this._parser.setExecuteHandler(C0.HT, () => this.tab());
+    this._parser.setExecuteHandler(C0.SO, () => this.shiftOut());
+    this._parser.setExecuteHandler(C0.SI, () => this.shiftIn());
+    // FIXME:   What do to with missing? Old code just added those to print.
+
+    // some C1 control codes - FIXME: should those be enabled by default?
+    this._parser.setExecuteHandler(C1.IND, () => this.index());
+    this._parser.setExecuteHandler(C1.NEL, () => this.nextLine());
+    this._parser.setExecuteHandler(C1.HTS, () => this.tabSet());
+
+    /**
+     * OSC handler
+     */
+    //   0 - icon name + title
+    this._parser.setOscHandler(0, (data) => this.setTitle(data));
+    //   1 - icon name
+    //   2 - title
+    this._parser.setOscHandler(2, (data) => this.setTitle(data));
+    //   3 - set property X in the form "prop=value"
+    //   4 - Change Color Number
+    //   5 - Change Special Color Number
+    //   6 - Enable/disable Special Color Number c
+    //   7 - current directory? (not in xterm spec, see https://gitlab.com/gnachman/iterm2/issues/3939)
+    //  10 - Change VT100 text foreground color to Pt.
+    //  11 - Change VT100 text background color to Pt.
+    //  12 - Change text cursor color to Pt.
+    //  13 - Change mouse foreground color to Pt.
+    //  14 - Change mouse background color to Pt.
+    //  15 - Change Tektronix foreground color to Pt.
+    //  16 - Change Tektronix background color to Pt.
+    //  17 - Change highlight background color to Pt.
+    //  18 - Change Tektronix cursor color to Pt.
+    //  19 - Change highlight foreground color to Pt.
+    //  46 - Change Log File to Pt.
+    //  50 - Set Font to Pt.
+    //  51 - reserved for Emacs shell.
+    //  52 - Manipulate Selection Data.
+    // 104 ; c - Reset Color Number c.
+    // 105 ; c - Reset Special Color Number c.
+    // 106 ; c; f - Enable/disable Special Color Number c.
+    // 110 - Reset VT100 text foreground color.
+    // 111 - Reset VT100 text background color.
+    // 112 - Reset text cursor color.
+    // 113 - Reset mouse foreground color.
+    // 114 - Reset mouse background color.
+    // 115 - Reset Tektronix foreground color.
+    // 116 - Reset Tektronix background color.
+    // 117 - Reset highlight color.
+    // 118 - Reset Tektronix cursor color.
+    // 119 - Reset highlight foreground color.
+
+    /**
+     * ESC handlers
+     */
+    this._parser.setEscHandler('7', () => this.saveCursor([]));
+    this._parser.setEscHandler('8', () => this.restoreCursor([]));
+    this._parser.setEscHandler('D', () => this.index());
+    this._parser.setEscHandler('E', () => this.nextLine());
+    this._parser.setEscHandler('H', () => this.tabSet());
+    this._parser.setEscHandler('M', () => this.reverseIndex());
+    this._parser.setEscHandler('=', () => this.keypadApplicationMode());
+    this._parser.setEscHandler('>', () => this.keypadNumericMode());
+    this._parser.setEscHandler('c', () => this.reset());
+    this._parser.setEscHandler('n', () => this.setgLevel(2));
+    this._parser.setEscHandler('o', () => this.setgLevel(3));
+    this._parser.setEscHandler('|', () => this.setgLevel(3));
+    this._parser.setEscHandler('}', () => this.setgLevel(2));
+    this._parser.setEscHandler('~', () => this.setgLevel(1));
+    this._parser.setEscHandler('%@', () => this.selectDefaultCharset());
+    this._parser.setEscHandler('%G', () => this.selectDefaultCharset());
+    for (const flag in CHARSETS) {
+      this._parser.setEscHandler('(' + flag, () => this.selectCharset('(' + flag));
+      this._parser.setEscHandler(')' + flag, () => this.selectCharset(')' + flag));
+      this._parser.setEscHandler('*' + flag, () => this.selectCharset('*' + flag));
+      this._parser.setEscHandler('+' + flag, () => this.selectCharset('+' + flag));
+      this._parser.setEscHandler('-' + flag, () => this.selectCharset('-' + flag));
+      this._parser.setEscHandler('.' + flag, () => this.selectCharset('.' + flag));
+      this._parser.setEscHandler('/' + flag, () => this.selectCharset('/' + flag)); // TODO: supported?
+    }
+
+    /**
+     * error handler
+     */
+    this._parser.setErrorHandler((state) => {
+      this._terminal.error('Parsing error: ', state);
+      return state;
+    });
+
+    /**
+     * DCS handler
+     */
+    this._parser.setDcsHandler('$q', new DECRQSS(this._terminal));
+  }
+
+  public dispose(): void {
+    super.dispose();
+    this._terminal = null;
+  }
+
+  public parse(data: string): void {
+    // Ensure the terminal is not disposed
+    if (!this._terminal) {
+      return;
+    }
+
+    let buffer = this._terminal.buffer;
+    const cursorStartX = buffer.x;
+    const cursorStartY = buffer.y;
+
+    // TODO: Consolidate debug/logging #1560
+    if ((<any>this._terminal).debug) {
+      this._terminal.log('data: ' + data);
+    }
+
+    if (this._parseBuffer.length < data.length) {
+      this._parseBuffer = new Uint32Array(data.length);
+    }
+    this._parser.parse(this._parseBuffer, this._stringDecoder.decode(data, this._parseBuffer));
+
+    buffer = this._terminal.buffer;
+    if (buffer.x !== cursorStartX || buffer.y !== cursorStartY) {
+      this._onCursorMove.fire();
+    }
+  }
+
+  public parseUtf8(data: Uint8Array): void {
+    // Ensure the terminal is not disposed
+    if (!this._terminal) {
+      return;
+    }
+
+    let buffer = this._terminal.buffer;
+    const cursorStartX = buffer.x;
+    const cursorStartY = buffer.y;
+
+    // TODO: Consolidate debug/logging #1560
+    if ((<any>this._terminal).debug) {
+      this._terminal.log('data: ' + data);
+    }
+
+    if (this._parseBuffer.length < data.length) {
+      this._parseBuffer = new Uint32Array(data.length);
+    }
+    this._parser.parse(this._parseBuffer, this._utf8Decoder.decode(data, this._parseBuffer));
+
+    buffer = this._terminal.buffer;
+    if (buffer.x !== cursorStartX || buffer.y !== cursorStartY) {
+      this._terminal.emit('cursormove');
+    }
+  }
+
+  public print(data: Uint32Array, start: number, end: number): void {
+    let code: number;
+    let chWidth: number;
+    const buffer = this._terminal.buffer;
+    const charset = this._terminal.charset;
+    const screenReaderMode = this._terminal.options.screenReaderMode;
+    const cols = this._terminal.cols;
+    const wraparoundMode = this._terminal.wraparoundMode;
+    const insertMode = this._terminal.insertMode;
+    const curAttr = this._terminal.curAttrData;
+    let bufferRow = buffer.lines.get(buffer.y + buffer.ybase);
+
+    this._terminal.updateRange(buffer.y);
+    for (let pos = start; pos < end; ++pos) {
+      code = data[pos];
 
       // calculate print space
       // expensive call, therefore we save width in line buffer
-      const chWidth = wcwidth(code);
+      chWidth = wcwidth(code);
 
-      if (this._terminal.charset && this._terminal.charset[char]) {
-        char = this._terminal.charset[char];
-      }
-
-      if (this._terminal.options.screenReaderMode) {
-        this._terminal.emit('a11y.char', char);
-      }
-
-      let row = buffer.y + buffer.ybase;
-
-      // insert combining char in last cell
-      // FIXME: needs handling after cursor jumps
-      if (!chWidth && buffer.x) {
-        // dont overflow left
-        if (buffer.lines.get(row)[buffer.x - 1]) {
-          if (!buffer.lines.get(row)[buffer.x - 1][CHAR_DATA_WIDTH_INDEX]) {
-            // found empty cell after fullwidth, need to go 2 cells back
-            if (buffer.lines.get(row)[buffer.x - 2]) {
-              buffer.lines.get(row)[buffer.x - 2][CHAR_DATA_CHAR_INDEX] += char;
-              buffer.lines.get(row)[buffer.x - 2][3] = char.charCodeAt(0);
-            }
-          } else {
-            buffer.lines.get(row)[buffer.x - 1][CHAR_DATA_CHAR_INDEX] += char;
-            buffer.lines.get(row)[buffer.x - 1][3] = char.charCodeAt(0);
-          }
-          this._terminal.updateRange(buffer.y);
+      // get charset replacement character
+      // charset is only defined for ASCII, therefore we only
+      // search for an replacement char if code < 127
+      if (code < 127 && charset) {
+        const ch = charset[String.fromCharCode(code)];
+        if (ch) {
+          code = ch.charCodeAt(0);
         }
-        return;
+      }
+
+      if (screenReaderMode) {
+        this._terminal.emit('a11y.char', stringFromCodePoint(code));
+      }
+
+      // insert combining char at last cursor position
+      // FIXME: needs handling after cursor jumps
+      // buffer.x should never be 0 for a combining char
+      // since they always follow a cell consuming char
+      // therefore we can test for buffer.x to avoid overflow left
+      if (!chWidth && buffer.x) {
+        if (!bufferRow.getWidth(buffer.x - 1)) {
+          // found empty cell after fullwidth, need to go 2 cells back
+          // it is save to step 2 cells back here
+          // since an empty cell is only set by fullwidth chars
+          bufferRow.addCodepointToCell(buffer.x - 2, code);
+        } else {
+          bufferRow.addCodepointToCell(buffer.x - 1, code);
+        }
+        continue;
       }
 
       // goto next line if ch would overflow
       // TODO: needs a global min terminal width of 2
-      if (buffer.x + chWidth - 1 >= this._terminal.cols) {
+      // FIXME: additionally ensure chWidth fits into a line
+      //   -->  maybe forbid cols<xy at higher level as it would
+      //        introduce a bad runtime penalty here
+      if (buffer.x + chWidth - 1 >= cols) {
         // autowrap - DECAWM
-        if (this._terminal.wraparoundMode) {
+        // automatically wraps to the beginning of the next line
+        if (wraparoundMode) {
           buffer.x = 0;
           buffer.y++;
           if (buffer.y > buffer.scrollBottom) {
@@ -74,44 +413,60 @@ export class InputHandler implements IInputHandler {
           } else {
             // The line already exists (eg. the initial viewport), mark it as a
             // wrapped line
-            (<any>buffer.lines.get(buffer.y)).isWrapped = true;
+            buffer.lines.get(buffer.y).isWrapped = true;
           }
+          // row changed, get it again
+          bufferRow = buffer.lines.get(buffer.y + buffer.ybase);
         } else {
-          if (chWidth === 2) { // FIXME: check for xterm behavior
-            return;
+          if (chWidth === 2) {
+            // FIXME: check for xterm behavior
+            // What to do here? We got a wide char that does not fit into last cell
+            continue;
           }
+          // FIXME: Do we have to set buffer.x to cols - 1, if not wrapping?
         }
       }
-      row = buffer.y + buffer.ybase;
 
       // insert mode: move characters to right
-      if (this._terminal.insertMode) {
-        // do this twice for a fullwidth char
-        for (let moves = 0; moves < chWidth; ++moves) {
-          // remove last cell, if it's width is 0
-          // we have to adjust the second last cell as well
-          const removed = buffer.lines.get(buffer.y + buffer.ybase).pop();
-          if (removed[CHAR_DATA_WIDTH_INDEX] === 0
-              && buffer.lines.get(row)[this._terminal.cols - 2]
-              && buffer.lines.get(row)[this._terminal.cols - 2][CHAR_DATA_WIDTH_INDEX] === 2) {
-            buffer.lines.get(row)[this._terminal.cols - 2] = [this._terminal.curAttr, ' ', 1, ' '.charCodeAt(0)];
-          }
-
-          // insert empty cell at cursor
-          buffer.lines.get(row).splice(buffer.x, 0, [this._terminal.curAttr, ' ', 1, ' '.charCodeAt(0)]);
+      if (insertMode) {
+        // right shift cells according to the width
+        bufferRow.insertCells(buffer.x, chWidth, buffer.getNullCell(curAttr));
+        // test last cell - since the last cell has only room for
+        // a halfwidth char any fullwidth shifted there is lost
+        // and will be set to empty cell
+        if (bufferRow.getWidth(cols - 1) === 2) {
+          bufferRow.setCellFromCodePoint(cols - 1, NULL_CELL_CODE, NULL_CELL_WIDTH, curAttr.fg, curAttr.bg);
         }
       }
 
-      buffer.lines.get(row)[buffer.x] = [this._terminal.curAttr, char, chWidth, char.charCodeAt(0)];
-      buffer.x++;
-      this._terminal.updateRange(buffer.y);
+      // write current char to buffer and advance cursor
+      bufferRow.setCellFromCodePoint(buffer.x++, code, chWidth, curAttr.fg, curAttr.bg);
 
-      // fullwidth char - set next cell width to zero and advance cursor
-      if (chWidth === 2) {
-        buffer.lines.get(row)[buffer.x] = [this._terminal.curAttr, '', 0, undefined];
-        buffer.x++;
+      // fullwidth char - also set next cell to placeholder stub and advance cursor
+      // for graphemes bigger than fullwidth we can simply loop to zero
+      // we already made sure above, that buffer.x + chWidth will not overflow right
+      if (chWidth > 0) {
+        while (--chWidth) {
+          // other than a regular empty cell a cell following a wide char has no width
+          bufferRow.setCellFromCodePoint(buffer.x++, 0, 0, curAttr.fg, curAttr.bg);
+        }
       }
     }
+    this._terminal.updateRange(buffer.y);
+  }
+
+  /**
+   * Forward addCsiHandler from parser.
+   */
+  public addCsiHandler(flag: string, callback: (params: number[], collect: string) => boolean): IDisposable {
+    return this._parser.addCsiHandler(flag, callback);
+  }
+
+  /**
+   * Forward addOscHandler from parser.
+   */
+  public addOscHandler(ident: number, callback: (data: string) => boolean): IDisposable {
+    return this._parser.addOscHandler(ident, callback);
   }
 
   /**
@@ -130,7 +485,7 @@ export class InputHandler implements IInputHandler {
     // make buffer local for faster access
     const buffer = this._terminal.buffer;
 
-    if (this._terminal.convertEol) {
+    if (this._terminal.options.convertEol) {
       buffer.x = 0;
     }
     buffer.y++;
@@ -142,12 +497,8 @@ export class InputHandler implements IInputHandler {
     if (buffer.x >= this._terminal.cols) {
       buffer.x--;
     }
-    /**
-     * This event is emitted whenever the terminal outputs a LF or NL.
-     *
-     * @event linefeed
-     */
-    this._terminal.emit('linefeed');
+
+    this._onLineFeed.fire();
   }
 
   /**
@@ -203,20 +554,12 @@ export class InputHandler implements IInputHandler {
    * Insert Ps (Blank) Character(s) (default = 1) (ICH).
    */
   public insertChars(params: number[]): void {
-    let param = params[0];
-    if (param < 1) param = 1;
-
-    // make buffer local for faster access
-    const buffer = this._terminal.buffer;
-
-    const row = buffer.y + buffer.ybase;
-    let j = buffer.x;
-    const ch: CharData = [this._terminal.eraseAttr(), ' ', 1, 32]; // xterm
-
-    while (param-- && j < this._terminal.cols) {
-      buffer.lines.get(row).splice(j++, 0, ch);
-      buffer.lines.get(row).pop();
-    }
+    this._terminal.buffer.lines.get(this._terminal.buffer.y + this._terminal.buffer.ybase).insertCells(
+      this._terminal.buffer.x,
+      params[0] || 1,
+      this._terminal.buffer.getNullCell(this._terminal.eraseAttrData())
+    );
+    this._terminal.updateRange(this._terminal.buffer.y);
   }
 
   /**
@@ -377,6 +720,34 @@ export class InputHandler implements IInputHandler {
   }
 
   /**
+   * Helper method to erase cells in a terminal row.
+   * The cell gets replaced with the eraseChar of the terminal.
+   * @param y row index
+   * @param start first cell index to be erased
+   * @param end   end - 1 is last erased cell
+   */
+  private _eraseInBufferLine(y: number, start: number, end: number, clearWrap: boolean = false): void {
+    const line = this._terminal.buffer.lines.get(this._terminal.buffer.ybase + y);
+    line.replaceCells(
+      start,
+      end,
+      this._terminal.buffer.getNullCell(this._terminal.eraseAttrData())
+    );
+    if (clearWrap) {
+      line.isWrapped = false;
+    }
+  }
+
+  /**
+   * Helper method to reset cells in a terminal row.
+   * The cell gets replaced with the eraseChar of the terminal and the isWrapped property is set to false.
+   * @param y row index
+   */
+  private _resetBufferLine(y: number): void {
+    this._eraseInBufferLine(y, 0, this._terminal.cols, true);
+  }
+
+  /**
    * CSI Ps J  Erase in Display (ED).
    *     Ps = 0  -> Erase Below (default).
    *     Ps = 1  -> Erase Above.
@@ -392,22 +763,35 @@ export class InputHandler implements IInputHandler {
     let j;
     switch (params[0]) {
       case 0:
-        this._terminal.eraseRight(this._terminal.buffer.x, this._terminal.buffer.y);
-        j = this._terminal.buffer.y + 1;
+        j = this._terminal.buffer.y;
+        this._terminal.updateRange(j);
+        this._eraseInBufferLine(j++, this._terminal.buffer.x, this._terminal.cols, this._terminal.buffer.x === 0);
         for (; j < this._terminal.rows; j++) {
-          this._terminal.eraseLine(j);
+          this._resetBufferLine(j);
         }
+        this._terminal.updateRange(j);
         break;
       case 1:
-        this._terminal.eraseLeft(this._terminal.buffer.x, this._terminal.buffer.y);
         j = this._terminal.buffer.y;
-        while (j--) {
-          this._terminal.eraseLine(j);
+        this._terminal.updateRange(j);
+        // Deleted front part of line and everything before. This line will no longer be wrapped.
+        this._eraseInBufferLine(j, 0, this._terminal.buffer.x + 1, true);
+        if (this._terminal.buffer.x + 1 >= this._terminal.cols) {
+          // Deleted entire previous line. This next line can no longer be wrapped.
+          this._terminal.buffer.lines.get(j + 1).isWrapped = false;
         }
+        while (j--) {
+          this._resetBufferLine(j);
+        }
+        this._terminal.updateRange(0);
         break;
       case 2:
         j = this._terminal.rows;
-        while (j--) this._terminal.eraseLine(j);
+        this._terminal.updateRange(j - 1);
+        while (j--) {
+          this._resetBufferLine(j);
+        }
+        this._terminal.updateRange(0);
         break;
       case 3:
         // Clear scrollback (everything not in viewport)
@@ -417,7 +801,7 @@ export class InputHandler implements IInputHandler {
           this._terminal.buffer.ybase = Math.max(this._terminal.buffer.ybase - scrollBackSize, 0);
           this._terminal.buffer.ydisp = Math.max(this._terminal.buffer.ydisp - scrollBackSize, 0);
           // Force a scroll event to refresh viewport
-          this._terminal.emit('scroll', 0);
+          this._onScroll.fire(0);
         }
         break;
     }
@@ -437,15 +821,16 @@ export class InputHandler implements IInputHandler {
   public eraseInLine(params: number[]): void {
     switch (params[0]) {
       case 0:
-        this._terminal.eraseRight(this._terminal.buffer.x, this._terminal.buffer.y);
+        this._eraseInBufferLine(this._terminal.buffer.y, this._terminal.buffer.x, this._terminal.cols);
         break;
       case 1:
-        this._terminal.eraseLeft(this._terminal.buffer.x, this._terminal.buffer.y);
+        this._eraseInBufferLine(this._terminal.buffer.y, 0, this._terminal.buffer.x + 1);
         break;
       case 2:
-        this._terminal.eraseLine(this._terminal.buffer.y);
+        this._eraseInBufferLine(this._terminal.buffer.y, 0, this._terminal.cols);
         break;
     }
+    this._terminal.updateRange(this._terminal.buffer.y);
   }
 
   /**
@@ -461,15 +846,15 @@ export class InputHandler implements IInputHandler {
     // make buffer local for faster access
     const buffer = this._terminal.buffer;
 
-    let row: number = buffer.y + buffer.ybase;
+    const row: number = buffer.y + buffer.ybase;
 
-    let scrollBottomRowsOffset = this._terminal.rows - 1 - buffer.scrollBottom;
-    let scrollBottomAbsolute = this._terminal.rows - 1 + buffer.ybase - scrollBottomRowsOffset + 1;
+    const scrollBottomRowsOffset = this._terminal.rows - 1 - buffer.scrollBottom;
+    const scrollBottomAbsolute = this._terminal.rows - 1 + buffer.ybase - scrollBottomRowsOffset + 1;
     while (param--) {
       // test: echo -e '\e[44m\e[1L\e[0m'
       // blankLine(true) - xterm/linux behavior
       buffer.lines.splice(scrollBottomAbsolute - 1, 1);
-      buffer.lines.splice(row, 0, this._terminal.blankLine(true));
+      buffer.lines.splice(row, 0, buffer.getBlankLine(this._terminal.eraseAttrData()));
     }
 
     // this.maxRange();
@@ -499,7 +884,7 @@ export class InputHandler implements IInputHandler {
       // test: echo -e '\e[44m\e[1M\e[0m'
       // blankLine(true) - xterm/linux behavior
       buffer.lines.splice(row, 1);
-      buffer.lines.splice(j, 0, this._terminal.blankLine(true));
+      buffer.lines.splice(j, 0, buffer.getBlankLine(this._terminal.eraseAttrData()));
     }
 
     // this.maxRange();
@@ -512,22 +897,12 @@ export class InputHandler implements IInputHandler {
    * Delete Ps Character(s) (default = 1) (DCH).
    */
   public deleteChars(params: number[]): void {
-    let param: number = params[0];
-    if (param < 1) {
-      param = 1;
-    }
-
-    // make buffer local for faster access
-    const buffer = this._terminal.buffer;
-
-    const row = buffer.y + buffer.ybase;
-    const ch: CharData = [this._terminal.eraseAttr(), ' ', 1, 32]; // xterm
-
-    while (param--) {
-      buffer.lines.get(row).splice(buffer.x, 1);
-      buffer.lines.get(row).push(ch);
-    }
-    this._terminal.updateRange(buffer.y);
+    this._terminal.buffer.lines.get(this._terminal.buffer.y + this._terminal.buffer.ybase).deleteCells(
+      this._terminal.buffer.x,
+      params[0] || 1,
+      this._terminal.buffer.getNullCell(this._terminal.eraseAttrData())
+    );
+    this._terminal.updateRange(this._terminal.buffer.y);
   }
 
   /**
@@ -541,7 +916,7 @@ export class InputHandler implements IInputHandler {
 
     while (param--) {
       buffer.lines.splice(buffer.ybase + buffer.scrollTop, 1);
-      buffer.lines.splice(buffer.ybase + buffer.scrollBottom, 0, this._terminal.blankLine());
+      buffer.lines.splice(buffer.ybase + buffer.scrollBottom, 0, buffer.getBlankLine(DEFAULT_ATTR_DATA));
     }
     // this.maxRange();
     this._terminal.updateRange(buffer.scrollTop);
@@ -551,19 +926,21 @@ export class InputHandler implements IInputHandler {
   /**
    * CSI Ps T  Scroll down Ps lines (default = 1) (SD).
    */
-  public scrollDown(params: number[]): void {
-    let param = params[0] || 1;
+  public scrollDown(params: number[], collect?: string): void {
+    if (params.length < 2 && !collect) {
+      let param = params[0] || 1;
 
-    // make buffer local for faster access
-    const buffer = this._terminal.buffer;
+      // make buffer local for faster access
+      const buffer = this._terminal.buffer;
 
-    while (param--) {
-      buffer.lines.splice(buffer.ybase + buffer.scrollBottom, 1);
-      buffer.lines.splice(buffer.ybase + buffer.scrollTop, 0, this._terminal.blankLine());
+      while (param--) {
+        buffer.lines.splice(buffer.ybase + buffer.scrollBottom, 1);
+        buffer.lines.splice(buffer.ybase + buffer.scrollTop, 0, buffer.getBlankLine(DEFAULT_ATTR_DATA));
+      }
+      // this.maxRange();
+      this._terminal.updateRange(buffer.scrollTop);
+      this._terminal.updateRange(buffer.scrollBottom);
     }
-    // this.maxRange();
-    this._terminal.updateRange(buffer.scrollTop);
-    this._terminal.updateRange(buffer.scrollBottom);
   }
 
   /**
@@ -571,21 +948,11 @@ export class InputHandler implements IInputHandler {
    * Erase Ps Character(s) (default = 1) (ECH).
    */
   public eraseChars(params: number[]): void {
-    let param = params[0];
-    if (param < 1) {
-      param = 1;
-    }
-
-    // make buffer local for faster access
-    const buffer = this._terminal.buffer;
-
-    const row = buffer.y + buffer.ybase;
-    let j = buffer.x;
-    const ch: CharData = [this._terminal.eraseAttr(), ' ', 1, 32]; // xterm
-
-    while (param-- && j < this._terminal.cols) {
-      buffer.lines.get(row)[j++] = ch;
-    }
+    this._terminal.buffer.lines.get(this._terminal.buffer.y + this._terminal.buffer.ybase).replaceCells(
+      this._terminal.buffer.x,
+      this._terminal.buffer.x + (params[0] || 1),
+      this._terminal.buffer.getNullCell(this._terminal.eraseAttrData())
+    );
   }
 
   /**
@@ -622,7 +989,7 @@ export class InputHandler implements IInputHandler {
    *   [columns] (default = [row,col+1]) (HPR)
    * reuse CSI Ps C ?
    */
-  public HPositionRelative(params: number[]): void {
+  public hPositionRelative(params: number[]): void {
     let param = params[0];
     if (param < 1) {
       param = 1;
@@ -637,17 +1004,15 @@ export class InputHandler implements IInputHandler {
    * CSI Ps b  Repeat the preceding graphic character Ps times (REP).
    */
   public repeatPrecedingCharacter(params: number[]): void {
-    let param = params[0] || 1;
-
     // make buffer local for faster access
     const buffer = this._terminal.buffer;
-
     const line = buffer.lines.get(buffer.ybase + buffer.y);
-    const ch = line[buffer.x - 1] || [this._terminal.defAttr, ' ', 1, 32];
-
-    while (param--) {
-      line[buffer.x++] = ch;
-    }
+    line.loadCell(buffer.x - 1, this._workCell);
+    line.replaceCells(buffer.x,
+      buffer.x + (params[0] || 1),
+      (this._workCell.content !== undefined) ? this._workCell : buffer.getNullCell(DEFAULT_ATTR_DATA)
+    );
+    // FIXME: no updateRange here?
   }
 
   /**
@@ -687,31 +1052,31 @@ export class InputHandler implements IInputHandler {
    *   xterm/charproc.c - line 2012, for more information.
    *   vim responds with ^[[?0c or ^[[?1c after the terminal's response (?)
    */
-  public sendDeviceAttributes(params: number[]): void {
+  public sendDeviceAttributes(params: number[], collect?: string): void {
     if (params[0] > 0) {
       return;
     }
 
-    if (!this._terminal.prefix) {
+    if (!collect) {
       if (this._terminal.is('xterm') || this._terminal.is('rxvt-unicode') || this._terminal.is('screen')) {
-        this._terminal.send(C0.ESC + '[?1;2c');
+        this._terminal.handler(C0.ESC + '[?1;2c');
       } else if (this._terminal.is('linux')) {
-        this._terminal.send(C0.ESC + '[?6c');
+        this._terminal.handler(C0.ESC + '[?6c');
       }
-    } else if (this._terminal.prefix === '>') {
+    } else if (collect === '>') {
       // xterm and urxvt
       // seem to spit this
       // out around ~370 times (?).
       if (this._terminal.is('xterm')) {
-        this._terminal.send(C0.ESC + '[>0;276;0c');
+        this._terminal.handler(C0.ESC + '[>0;276;0c');
       } else if (this._terminal.is('rxvt-unicode')) {
-        this._terminal.send(C0.ESC + '[>85;95;0c');
+        this._terminal.handler(C0.ESC + '[>85;95;0c');
       } else if (this._terminal.is('linux')) {
         // not supported by linux console.
         // linux console echoes parameters.
-        this._terminal.send(params[0] + 'c');
+        this._terminal.handler(params[0] + 'c');
       } else if (this._terminal.is('screen')) {
-        this._terminal.send(C0.ESC + '[>83;40003;0c');
+        this._terminal.handler(C0.ESC + '[>83;40003;0c');
       }
     }
   }
@@ -736,7 +1101,7 @@ export class InputHandler implements IInputHandler {
    *   [rows] (default = [row+1,column])
    * reuse CSI Ps B ?
    */
-  public VPositionRelative(params: number[]): void {
+  public vPositionRelative(params: number[]): void {
     let param = params[0];
     if (param < 1) {
       param = 1;
@@ -756,7 +1121,7 @@ export class InputHandler implements IInputHandler {
    *   Horizontal and Vertical Position [row;column] (default =
    *   [1,1]) (HVP).
    */
-  public HVPosition(params: number[]): void {
+  public hVPosition(params: number[]): void {
     if (params[0] < 1) params[0] = 1;
     if (params[1] < 1) params[1] = 1;
 
@@ -780,7 +1145,7 @@ export class InputHandler implements IInputHandler {
    *   http://vt100.net/annarbor/aaa-ug/section6.html
    */
   public tabClear(params: number[]): void {
-    let param = params[0];
+    const param = params[0];
     if (param <= 0) {
       delete this._terminal.buffer.tabs[this._terminal.buffer.x];
     } else if (param === 3) {
@@ -874,7 +1239,7 @@ export class InputHandler implements IInputHandler {
    * Modes:
    *   http: *vt100.net/docs/vt220-rm/chapter4.html
    */
-  public setMode(params: number[]): void {
+  public setMode(params: number[], collect?: string): void {
     if (params.length > 1) {
       for (let i = 0; i < params.length; i++) {
         this.setMode([params[i]]);
@@ -883,7 +1248,7 @@ export class InputHandler implements IInputHandler {
       return;
     }
 
-    if (!this._terminal.prefix) {
+    if (!collect) {
       switch (params[0]) {
         case 4:
           this._terminal.insertMode = true;
@@ -892,7 +1257,7 @@ export class InputHandler implements IInputHandler {
           // this._t.convertEol = true;
           break;
       }
-    } else if (this._terminal.prefix === '?') {
+    } else if (collect === '?') {
       switch (params[0]) {
         case 1:
           this._terminal.applicationCursor = true;
@@ -920,7 +1285,9 @@ export class InputHandler implements IInputHandler {
         case 66:
           this._terminal.log('Serial port requested application keypad.');
           this._terminal.applicationKeypad = true;
-          this._terminal.viewport.syncScrollArea();
+          if (this._terminal.viewport) {
+            this._terminal.viewport.syncScrollArea();
+          }
           break;
         case 9: // X10 Mouse
           // no release, no motion, no wheel, no modifiers.
@@ -938,8 +1305,12 @@ export class InputHandler implements IInputHandler {
           this._terminal.vt200Mouse = params[0] === 1000;
           this._terminal.normalMouse = params[0] > 1000;
           this._terminal.mouseEvents = true;
-          this._terminal.element.classList.add('enable-mouse-events');
-          this._terminal.selectionManager.disable();
+          if (this._terminal.element) {
+            this._terminal.element.classList.add('enable-mouse-events');
+          }
+          if (this._terminal.selectionManager) {
+            this._terminal.selectionManager.disable();
+          }
           this._terminal.log('Binding to mouse events.');
           break;
         case 1004: // send focusin/focusout events
@@ -969,14 +1340,19 @@ export class InputHandler implements IInputHandler {
         case 25: // show cursor
           this._terminal.cursorHidden = false;
           break;
+        case 1048: // alt screen cursor
+          this.saveCursor(params);
+          break;
         case 1049: // alt screen buffer cursor
-          // TODO: Not sure if we need to save/restore after switching the buffer
-          // this.saveCursor(params);
+          this.saveCursor(params);
           // FALL-THROUGH
         case 47: // alt screen buffer
         case 1047: // alt screen buffer
-          this._terminal.buffers.activateAltBuffer();
-          this._terminal.viewport.syncScrollArea();
+          this._terminal.buffers.activateAltBuffer(this._terminal.eraseAttrData());
+          this._terminal.refresh(0, this._terminal.rows - 1);
+          if (this._terminal.viewport) {
+            this._terminal.viewport.syncScrollArea();
+          }
           this._terminal.showCursor();
           break;
         case 2004: // bracketed paste mode (https://cirw.in/blog/bracketed-paste)
@@ -1068,7 +1444,7 @@ export class InputHandler implements IInputHandler {
    *     Ps = 1 0 6 1  -> Reset keyboard emulation to Sun/PC style.
    *     Ps = 2 0 0 4  -> Reset bracketed paste mode.
    */
-  public resetMode(params: number[]): void {
+  public resetMode(params: number[], collect?: string): void {
     if (params.length > 1) {
       for (let i = 0; i < params.length; i++) {
         this.resetMode([params[i]]);
@@ -1077,7 +1453,7 @@ export class InputHandler implements IInputHandler {
       return;
     }
 
-    if (!this._terminal.prefix) {
+    if (!collect) {
       switch (params[0]) {
         case 4:
           this._terminal.insertMode = false;
@@ -1086,7 +1462,7 @@ export class InputHandler implements IInputHandler {
           // this._t.convertEol = false;
           break;
       }
-    } else if (this._terminal.prefix === '?') {
+    } else if (collect === '?') {
       switch (params[0]) {
         case 1:
           this._terminal.applicationCursor = false;
@@ -1109,7 +1485,9 @@ export class InputHandler implements IInputHandler {
         case 66:
           this._terminal.log('Switching back to normal keypad.');
           this._terminal.applicationKeypad = false;
-          this._terminal.viewport.syncScrollArea();
+          if (this._terminal.viewport) {
+            this._terminal.viewport.syncScrollArea();
+          }
           break;
         case 9: // X10 Mouse
         case 1000: // vt200 mouse
@@ -1119,8 +1497,12 @@ export class InputHandler implements IInputHandler {
           this._terminal.vt200Mouse = false;
           this._terminal.normalMouse = false;
           this._terminal.mouseEvents = false;
-          this._terminal.element.classList.remove('enable-mouse-events');
-          this._terminal.selectionManager.enable();
+          if (this._terminal.element) {
+            this._terminal.element.classList.remove('enable-mouse-events');
+          }
+          if (this._terminal.selectionManager) {
+            this._terminal.selectionManager.enable();
+          }
           break;
         case 1004: // send focusin/focusout events
           this._terminal.sendFocus = false;
@@ -1137,18 +1519,22 @@ export class InputHandler implements IInputHandler {
         case 25: // hide cursor
           this._terminal.cursorHidden = true;
           break;
+        case 1048: // alt screen cursor
+          this.restoreCursor(params);
+          break;
         case 1049: // alt screen buffer cursor
            // FALL-THROUGH
         case 47: // normal screen buffer
         case 1047: // normal screen buffer - clearing it first
           // Ensure the selection manager has the correct buffer
           this._terminal.buffers.activateNormalBuffer();
-          // TODO: Not sure if we need to save/restore after switching the buffer
-          // if (params[0] === 1049) {
-          //   this.restoreCursor(params);
-          // }
+          if (params[0] === 1049) {
+            this.restoreCursor(params);
+          }
           this._terminal.refresh(0, this._terminal.rows - 1);
-          this._terminal.viewport.syncScrollArea();
+          if (this._terminal.viewport) {
+            this._terminal.viewport.syncScrollArea();
+          }
           this._terminal.showCursor();
           break;
         case 2004: // bracketed paste mode (https://cirw.in/blog/bracketed-paste)
@@ -1226,124 +1612,124 @@ export class InputHandler implements IInputHandler {
   public charAttributes(params: number[]): void {
     // Optimize a single SGR0.
     if (params.length === 1 && params[0] === 0) {
-      this._terminal.curAttr = this._terminal.defAttr;
+      this._terminal.curAttrData.fg = DEFAULT_ATTR_DATA.fg;
+      this._terminal.curAttrData.bg = DEFAULT_ATTR_DATA.bg;
       return;
     }
 
     const l = params.length;
-    let flags = this._terminal.curAttr >> 18;
-    let fg = (this._terminal.curAttr >> 9) & 0x1ff;
-    let bg = this._terminal.curAttr & 0x1ff;
     let p;
+    const attr = this._terminal.curAttrData;
 
     for (let i = 0; i < l; i++) {
       p = params[i];
       if (p >= 30 && p <= 37) {
         // fg color 8
-        fg = p - 30;
+        attr.fg &= ~(Attributes.CM_MASK | Attributes.PCOLOR_MASK);
+        attr.fg |= Attributes.CM_P16 | (p - 30);
       } else if (p >= 40 && p <= 47) {
         // bg color 8
-        bg = p - 40;
+        attr.bg &= ~(Attributes.CM_MASK | Attributes.PCOLOR_MASK);
+        attr.bg |= Attributes.CM_P16 | (p - 40);
       } else if (p >= 90 && p <= 97) {
         // fg color 16
-        p += 8;
-        fg = p - 90;
+        attr.fg &= ~(Attributes.CM_MASK | Attributes.PCOLOR_MASK);
+        attr.fg |= Attributes.CM_P16 | (p - 90) | 8;
       } else if (p >= 100 && p <= 107) {
         // bg color 16
-        p += 8;
-        bg = p - 100;
+        attr.bg &= ~(Attributes.CM_MASK | Attributes.PCOLOR_MASK);
+        attr.bg |= Attributes.CM_P16 | (p - 100) | 8;
       } else if (p === 0) {
         // default
-        flags = this._terminal.defAttr >> 18;
-        fg = (this._terminal.defAttr >> 9) & 0x1ff;
-        bg = this._terminal.defAttr & 0x1ff;
-        // flags = 0;
-        // fg = 0x1ff;
-        // bg = 0x1ff;
+        attr.fg = DEFAULT_ATTR_DATA.fg;
+        attr.bg = DEFAULT_ATTR_DATA.bg;
       } else if (p === 1) {
         // bold text
-        flags |= FLAGS.BOLD;
+        attr.fg |= FgFlags.BOLD;
       } else if (p === 3) {
         // italic text
-        flags |= FLAGS.ITALIC;
+        attr.bg |= BgFlags.ITALIC;
       } else if (p === 4) {
         // underlined text
-        flags |= FLAGS.UNDERLINE;
+        attr.fg |= FgFlags.UNDERLINE;
       } else if (p === 5) {
         // blink
-        flags |= FLAGS.BLINK;
+        attr.fg |= FgFlags.BLINK;
       } else if (p === 7) {
         // inverse and positive
         // test with: echo -e '\e[31m\e[42mhello\e[7mworld\e[27mhi\e[m'
-        flags |= FLAGS.INVERSE;
+        attr.fg |= FgFlags.INVERSE;
       } else if (p === 8) {
         // invisible
-        flags |= FLAGS.INVISIBLE;
+        attr.fg |= FgFlags.INVISIBLE;
       } else if (p === 2) {
         // dimmed text
-        flags |= FLAGS.DIM;
+        attr.bg |= BgFlags.DIM;
       } else if (p === 22) {
         // not bold nor faint
-        flags &= ~FLAGS.BOLD;
-        flags &= ~FLAGS.DIM;
+        attr.fg &= ~FgFlags.BOLD;
+        attr.bg &= ~BgFlags.DIM;
+      } else if (p === 23) {
+        // not italic
+        attr.bg &= ~BgFlags.ITALIC;
       } else if (p === 24) {
         // not underlined
-        flags &= ~FLAGS.UNDERLINE;
+        attr.fg &= ~FgFlags.UNDERLINE;
       } else if (p === 25) {
         // not blink
-        flags &= ~FLAGS.BLINK;
+        attr.fg &= ~FgFlags.BLINK;
       } else if (p === 27) {
         // not inverse
-        flags &= ~FLAGS.INVERSE;
+        attr.fg &= ~FgFlags.INVERSE;
       } else if (p === 28) {
         // not invisible
-        flags &= ~FLAGS.INVISIBLE;
+        attr.fg &= ~FgFlags.INVISIBLE;
       } else if (p === 39) {
         // reset fg
-        fg = (this._terminal.defAttr >> 9) & 0x1ff;
+        attr.fg &= ~(Attributes.CM_MASK | Attributes.RGB_MASK);
+        attr.fg |= DEFAULT_ATTR_DATA.fg & (Attributes.PCOLOR_MASK | Attributes.RGB_MASK);
       } else if (p === 49) {
         // reset bg
-        bg = this._terminal.defAttr & 0x1ff;
+        attr.bg &= ~(Attributes.CM_MASK | Attributes.RGB_MASK);
+        attr.bg |= DEFAULT_ATTR_DATA.bg & (Attributes.PCOLOR_MASK | Attributes.RGB_MASK);
       } else if (p === 38) {
         // fg color 256
         if (params[i + 1] === 2) {
           i += 2;
-          fg = this._terminal.matchColor(
-            params[i] & 0xff,
-            params[i + 1] & 0xff,
-            params[i + 2] & 0xff);
-          if (fg === -1) fg = 0x1ff;
+          attr.fg |= Attributes.CM_RGB;
+          attr.fg &= ~Attributes.RGB_MASK;
+          attr.fg |= AttributeData.fromColorRGB([params[i], params[i + 1], params[i + 2]]);
           i += 2;
         } else if (params[i + 1] === 5) {
           i += 2;
           p = params[i] & 0xff;
-          fg = p;
+          attr.fg &= ~Attributes.PCOLOR_MASK;
+          attr.fg |= Attributes.CM_P256 | p;
         }
       } else if (p === 48) {
         // bg color 256
         if (params[i + 1] === 2) {
           i += 2;
-          bg = this._terminal.matchColor(
-            params[i] & 0xff,
-            params[i + 1] & 0xff,
-            params[i + 2] & 0xff);
-          if (bg === -1) bg = 0x1ff;
+          attr.bg |= Attributes.CM_RGB;
+          attr.bg &= ~Attributes.RGB_MASK;
+          attr.bg |= AttributeData.fromColorRGB([params[i], params[i + 1], params[i + 2]]);
           i += 2;
         } else if (params[i + 1] === 5) {
           i += 2;
           p = params[i] & 0xff;
-          bg = p;
+          attr.bg &= ~Attributes.PCOLOR_MASK;
+          attr.bg |= Attributes.CM_P256 | p;
         }
       } else if (p === 100) {
         // reset fg/bg
-        fg = (this._terminal.defAttr >> 9) & 0x1ff;
-        bg = this._terminal.defAttr & 0x1ff;
+        attr.fg &= ~(Attributes.CM_MASK | Attributes.RGB_MASK);
+        attr.fg |= DEFAULT_ATTR_DATA.fg & (Attributes.PCOLOR_MASK | Attributes.RGB_MASK);
+        attr.bg &= ~(Attributes.CM_MASK | Attributes.RGB_MASK);
+        attr.bg |= DEFAULT_ATTR_DATA.bg & (Attributes.PCOLOR_MASK | Attributes.RGB_MASK);
       } else {
         this._terminal.error('Unknown SGR attribute: %d.', p);
       }
     }
-
-    this._terminal.curAttr = (flags << 18) | (fg << 9) | bg;
   }
 
   /**
@@ -1369,49 +1755,45 @@ export class InputHandler implements IInputHandler {
    *   CSI ? 5 3  n  Locator available, if compiled-in, or
    *   CSI ? 5 0  n  No Locator, if not.
    */
-  public deviceStatus(params: number[]): void {
-    if (!this._terminal.prefix) {
+  public deviceStatus(params: number[], collect?: string): void {
+    if (!collect) {
       switch (params[0]) {
         case 5:
           // status report
-          this._terminal.send(C0.ESC + '[0n');
+          this._onData.fire(`${C0.ESC}[0n`);
           break;
         case 6:
           // cursor position
-          this._terminal.send(C0.ESC + '['
-                    + (this._terminal.buffer.y + 1)
-                    + ';'
-                    + (this._terminal.buffer.x + 1)
-                    + 'R');
+          const y = this._terminal.buffer.y + 1;
+          const x = this._terminal.buffer.x + 1;
+          this._onData.fire(`${C0.ESC}[${y};${x}R`);
           break;
       }
-    } else if (this._terminal.prefix === '?') {
+    } else if (collect === '?') {
       // modern xterm doesnt seem to
       // respond to any of these except ?6, 6, and 5
       switch (params[0]) {
         case 6:
           // cursor position
-          this._terminal.send(C0.ESC + '[?'
-                    + (this._terminal.buffer.y + 1)
-                    + ';'
-                    + (this._terminal.buffer.x + 1)
-                    + 'R');
+          const y = this._terminal.buffer.y + 1;
+          const x = this._terminal.buffer.x + 1;
+          this._onData.fire(`${C0.ESC}[?${y};${x}R`);
           break;
         case 15:
           // no printer
-          // this.send(C0.ESC + '[?11n');
+          // this.handler(C0.ESC + '[?11n');
           break;
         case 25:
           // dont support user defined keys
-          // this.send(C0.ESC + '[?21n');
+          // this.handler(C0.ESC + '[?21n');
           break;
         case 26:
           // north american keyboard
-          // this.send(C0.ESC + '[?27;1;0;0n');
+          // this.handler(C0.ESC + '[?27;1;0;0n');
           break;
         case 53:
           // no dec locator/mouse
-          // this.send(C0.ESC + '[?50n');
+          // this.handler(C0.ESC + '[?50n');
           break;
       }
     }
@@ -1421,21 +1803,25 @@ export class InputHandler implements IInputHandler {
    * CSI ! p   Soft terminal reset (DECSTR).
    * http://vt100.net/docs/vt220-rm/table4-10.html
    */
-  public softReset(params: number[]): void {
-    this._terminal.cursorHidden = false;
-    this._terminal.insertMode = false;
-    this._terminal.originMode = false;
-    this._terminal.wraparoundMode = true;  // defaults: xterm - true, vt100 - false
-    this._terminal.applicationKeypad = false; // ?
-    this._terminal.viewport.syncScrollArea();
-    this._terminal.applicationCursor = false;
-    this._terminal.buffer.scrollTop = 0;
-    this._terminal.buffer.scrollBottom = this._terminal.rows - 1;
-    this._terminal.curAttr = this._terminal.defAttr;
-    this._terminal.buffer.x = this._terminal.buffer.y = 0; // ?
-    this._terminal.charset = null;
-    this._terminal.glevel = 0; // ??
-    this._terminal.charsets = [null]; // ??
+  public softReset(params: number[], collect?: string): void {
+    if (collect === '!') {
+      this._terminal.cursorHidden = false;
+      this._terminal.insertMode = false;
+      this._terminal.originMode = false;
+      this._terminal.wraparoundMode = true;  // defaults: xterm - true, vt100 - false
+      this._terminal.applicationKeypad = false; // ?
+      if (this._terminal.viewport) {
+        this._terminal.viewport.syncScrollArea();
+      }
+      this._terminal.applicationCursor = false;
+      this._terminal.buffer.scrollTop = 0;
+      this._terminal.buffer.scrollBottom = this._terminal.rows - 1;
+      this._terminal.curAttrData = DEFAULT_ATTR_DATA;
+      this._terminal.buffer.x = this._terminal.buffer.y = 0; // ?
+      this._terminal.charset = null;
+      this._terminal.glevel = 0; // ??
+      this._terminal.charsets = [null]; // ??
+    }
   }
 
   /**
@@ -1448,24 +1834,26 @@ export class InputHandler implements IInputHandler {
    *   Ps = 5  -> blinking bar (xterm).
    *   Ps = 6  -> steady bar (xterm).
    */
-  public setCursorStyle(params?: number[]): void {
-    const param = params[0] < 1 ? 1 : params[0];
-    switch (param) {
-      case 1:
-      case 2:
-        this._terminal.setOption('cursorStyle', 'block');
-        break;
-      case 3:
-      case 4:
-        this._terminal.setOption('cursorStyle', 'underline');
-        break;
-      case 5:
-      case 6:
-        this._terminal.setOption('cursorStyle', 'bar');
-        break;
+  public setCursorStyle(params?: number[], collect?: string): void {
+    if (collect === ' ') {
+      const param = params[0] < 1 ? 1 : params[0];
+      switch (param) {
+        case 1:
+        case 2:
+          this._terminal.setOption('cursorStyle', 'block');
+          break;
+        case 3:
+        case 4:
+          this._terminal.setOption('cursorStyle', 'underline');
+          break;
+        case 5:
+        case 6:
+          this._terminal.setOption('cursorStyle', 'bar');
+          break;
+      }
+      const isBlinking = param % 2 === 1;
+      this._terminal.setOption('cursorBlink', isBlinking);
     }
-    const isBlinking = param % 2 === 1;
-    this._terminal.setOption('cursorBlink', isBlinking);
   }
 
   /**
@@ -1474,8 +1862,10 @@ export class InputHandler implements IInputHandler {
    *   dow) (DECSTBM).
    * CSI ? Pm r
    */
-  public setScrollRegion(params: number[]): void {
-    if (this._terminal.prefix) return;
+  public setScrollRegion(params: number[], collect?: string): void {
+    if (collect) {
+      return;
+    }
     this._terminal.buffer.scrollTop = (params[0] || 1) - 1;
     this._terminal.buffer.scrollBottom = (params[1] && params[1] <= this._terminal.rows ? params[1] : this._terminal.rows) - 1;
     this._terminal.buffer.x = 0;
@@ -1485,20 +1875,168 @@ export class InputHandler implements IInputHandler {
 
   /**
    * CSI s
+   * ESC 7
    *   Save cursor (ANSI.SYS).
    */
   public saveCursor(params: number[]): void {
     this._terminal.buffer.savedX = this._terminal.buffer.x;
     this._terminal.buffer.savedY = this._terminal.buffer.y;
+    this._terminal.buffer.savedCurAttrData.fg = this._terminal.curAttrData.fg;
+    this._terminal.buffer.savedCurAttrData.bg = this._terminal.curAttrData.bg;
   }
 
 
   /**
    * CSI u
+   * ESC 8
    *   Restore cursor (ANSI.SYS).
    */
   public restoreCursor(params: number[]): void {
     this._terminal.buffer.x = this._terminal.buffer.savedX || 0;
     this._terminal.buffer.y = this._terminal.buffer.savedY || 0;
+    this._terminal.curAttrData.fg = this._terminal.buffer.savedCurAttrData.fg;
+    this._terminal.curAttrData.bg = this._terminal.buffer.savedCurAttrData.bg;
+  }
+
+
+  /**
+   * OSC 0; <data> ST (set icon name + window title)
+   * OSC 2; <data> ST (set window title)
+   *   Proxy to set window title. Icon name is not supported.
+   */
+  public setTitle(data: string): void {
+    this._terminal.handleTitle(data);
+  }
+
+  /**
+   * ESC E
+   * C1.NEL
+   *   DEC mnemonic: NEL (https://vt100.net/docs/vt510-rm/NEL)
+   *   Moves cursor to first position on next line.
+   */
+  public nextLine(): void {
+    this._terminal.buffer.x = 0;
+    this.index();
+  }
+
+  /**
+   * ESC =
+   *   DEC mnemonic: DECKPAM (https://vt100.net/docs/vt510-rm/DECKPAM.html)
+   *   Enables the numeric keypad to send application sequences to the host.
+   */
+  public keypadApplicationMode(): void {
+    this._terminal.log('Serial port requested application keypad.');
+    this._terminal.applicationKeypad = true;
+    if (this._terminal.viewport) {
+      this._terminal.viewport.syncScrollArea();
+    }
+  }
+
+  /**
+   * ESC >
+   *   DEC mnemonic: DECKPNM (https://vt100.net/docs/vt510-rm/DECKPNM.html)
+   *   Enables the keypad to send numeric characters to the host.
+   */
+  public keypadNumericMode(): void {
+    this._terminal.log('Switching back to normal keypad.');
+    this._terminal.applicationKeypad = false;
+    if (this._terminal.viewport) {
+      this._terminal.viewport.syncScrollArea();
+    }
+  }
+
+  /**
+   * ESC % @
+   * ESC % G
+   *   Select default character set. UTF-8 is not supported (string are unicode anyways)
+   *   therefore ESC % G does the same.
+   */
+  public selectDefaultCharset(): void {
+    this._terminal.setgLevel(0);
+    this._terminal.setgCharset(0, DEFAULT_CHARSET); // US (default)
+  }
+
+  /**
+   * ESC ( C
+   *   Designate G0 Character Set, VT100, ISO 2022.
+   * ESC ) C
+   *   Designate G1 Character Set (ISO 2022, VT100).
+   * ESC * C
+   *   Designate G2 Character Set (ISO 2022, VT220).
+   * ESC + C
+   *   Designate G3 Character Set (ISO 2022, VT220).
+   * ESC - C
+   *   Designate G1 Character Set (VT300).
+   * ESC . C
+   *   Designate G2 Character Set (VT300).
+   * ESC / C
+   *   Designate G3 Character Set (VT300). C = A  -> ISO Latin-1 Supplemental. - Supported?
+   */
+  public selectCharset(collectAndFlag: string): void {
+    if (collectAndFlag.length !== 2) {
+      this.selectDefaultCharset();
+      return;
+    }
+    if (collectAndFlag[0] === '/') {
+      return;  // TODO: Is this supported?
+    }
+    this._terminal.setgCharset(GLEVEL[collectAndFlag[0]], CHARSETS[collectAndFlag[1]] || DEFAULT_CHARSET);
+    return;
+  }
+
+  /**
+   * ESC D
+   * C1.IND
+   *   DEC mnemonic: IND (https://vt100.net/docs/vt510-rm/IND.html)
+   *   Moves the cursor down one line in the same column.
+   */
+  public index(): void {
+    this._terminal.index();  // TODO: save to move from terminal?
+  }
+
+  /**
+   * ESC H
+   * C1.HTS
+   *   DEC mnemonic: HTS (https://vt100.net/docs/vt510-rm/HTS.html)
+   *   Sets a horizontal tab stop at the column position indicated by
+   *   the value of the active column when the terminal receives an HTS.
+   */
+  public tabSet(): void {
+    this._terminal.tabSet();  // TODO: save to move from terminal?
+  }
+
+  /**
+   * ESC M
+   * C1.RI
+   *   DEC mnemonic: HTS
+   *   Moves the cursor up one line in the same column. If the cursor is at the top margin,
+   *   the page scrolls down.
+   */
+  public reverseIndex(): void {
+    this._terminal.reverseIndex();  // TODO: save to move from terminal?
+  }
+
+  /**
+   * ESC c
+   *   DEC mnemonic: RIS (https://vt100.net/docs/vt510-rm/RIS.html)
+   *   Reset to initial state.
+   */
+  public reset(): void {
+    this._parser.reset();
+    this._terminal.reset();  // TODO: save to move from terminal?
+  }
+
+  /**
+   * ESC n
+   * ESC o
+   * ESC |
+   * ESC }
+   * ESC ~
+   *   DEC mnemonic: LS (https://vt100.net/docs/vt510-rm/LS.html)
+   *   When you use a locking shift, the character set remains in GL or GR until
+   *   you use another locking shift. (partly supported)
+   */
+  public setgLevel(level: number): void {
+    this._terminal.setgLevel(level);  // TODO: save to move from terminal?
   }
 }

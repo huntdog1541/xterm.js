@@ -3,17 +3,20 @@
  * @license MIT
  */
 
-import { ILinkHoverEvent, ITerminal, ILinkifierAccessor, LinkHoverEventTypes } from '../Types';
-import { IColorSet, IRenderDimensions } from './Types';
+import { ILinkifierEvent, ITerminal, ILinkifierAccessor } from '../Types';
+import { IRenderDimensions } from './Types';
 import { BaseRenderLayer } from './BaseRenderLayer';
+import { INVERTED_DEFAULT_COLOR } from './atlas/Types';
+import { is256Color } from './atlas/CharAtlasUtils';
+import { IColorSet } from '../ui/Types';
 
 export class LinkRenderLayer extends BaseRenderLayer {
-  private _state: ILinkHoverEvent = null;
+  private _state: ILinkifierEvent = null;
 
   constructor(container: HTMLElement, zIndex: number, colors: IColorSet, terminal: ILinkifierAccessor) {
     super(container, 'link', zIndex, true, colors);
-    terminal.linkifier.on(LinkHoverEventTypes.HOVER, (e: ILinkHoverEvent) => this._onLinkHover(e));
-    terminal.linkifier.on(LinkHoverEventTypes.LEAVE, (e: ILinkHoverEvent) => this._onLinkLeave(e));
+    terminal.linkifier.onLinkHover(e => this._onLinkHover(e));
+    terminal.linkifier.onLinkLeave(e => this._onLinkLeave(e));
   }
 
   public resize(terminal: ITerminal, dim: IRenderDimensions): void {
@@ -38,8 +41,16 @@ export class LinkRenderLayer extends BaseRenderLayer {
     }
   }
 
-  private _onLinkHover(e: ILinkHoverEvent): void {
-    this._ctx.fillStyle = this._colors.foreground.css;
+  private _onLinkHover(e: ILinkifierEvent): void {
+    if (e.fg === INVERTED_DEFAULT_COLOR) {
+      this._ctx.fillStyle = this._colors.background.css;
+    } else if (is256Color(e.fg)) {
+      // 256 color support
+      this._ctx.fillStyle = this._colors.ansi[e.fg].css;
+    } else {
+      this._ctx.fillStyle = this._colors.foreground.css;
+    }
+
     if (e.y1 === e.y2) {
       // Single line link
       this.fillBottomLineAtCells(e.x1, e.y1, e.x2 - e.x1);
@@ -54,7 +65,7 @@ export class LinkRenderLayer extends BaseRenderLayer {
     this._state = e;
   }
 
-  private _onLinkLeave(e: ILinkHoverEvent): void {
+  private _onLinkLeave(e: ILinkifierEvent): void {
     this._clearCurrentLink();
   }
 }

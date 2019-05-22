@@ -4,12 +4,14 @@
  */
 
 import { assert } from 'chai';
-import { CharMeasure } from './utils/CharMeasure';
-import { SelectionManager } from './SelectionManager';
+import { CharMeasure } from './CharMeasure';
+import { SelectionManager, SelectionMode } from './SelectionManager';
 import { SelectionModel } from './SelectionModel';
 import { BufferSet } from './BufferSet';
-import { LineData, CharData, ITerminal, IBuffer } from './Types';
-import { MockTerminal } from './utils/TestUtils.test';
+import { ITerminal, IBuffer } from './Types';
+import { IBufferLine } from './core/Types';
+import { MockTerminal } from './TestUtils.test';
+import { BufferLine, CellData } from './core/buffer/BufferLine';
 
 class TestMockTerminal extends MockTerminal {
   emit(event: string, data: any): void {}
@@ -25,8 +27,11 @@ class TestSelectionManager extends SelectionManager {
 
   public get model(): SelectionModel { return this._model; }
 
+  public set selectionMode(mode: SelectionMode) { this._activeSelectionMode = mode; }
+
   public selectLineAt(line: number): void { this._selectLineAt(line); }
   public selectWordAt(coords: [number, number]): void { this._selectWordAt(coords, true); }
+  public areCoordsInSelection(coords: [number, number], start: [number, number], end: [number, number]): boolean { return this._areCoordsInSelection(coords, start, end); }
 
   // Disable DOM interaction
   public enable(): void {}
@@ -41,8 +46,8 @@ describe('SelectionManager', () => {
 
   beforeEach(() => {
     terminal = new TestMockTerminal();
-    terminal.cols = 80;
-    terminal.rows = 2;
+    (terminal as any).cols = 80;
+    (terminal as any).rows = 2;
     terminal.options.scrollback = 100;
     terminal.buffers = new BufferSet(terminal);
     terminal.buffer = terminal.buffers.active;
@@ -50,16 +55,18 @@ describe('SelectionManager', () => {
     selectionManager = new TestSelectionManager(terminal, null);
   });
 
-  function stringToRow(text: string): LineData {
-    let result: LineData = [];
+  function stringToRow(text: string): IBufferLine {
+    const result = new BufferLine(text.length);
     for (let i = 0; i < text.length; i++) {
-      result.push([0, text.charAt(i), 1, text.charCodeAt(i)]);
+      result.setCell(i, CellData.fromCharData([0, text.charAt(i), 1, text.charCodeAt(i)]));
     }
     return result;
   }
 
-  function stringArrayToRow(chars: string[]): LineData {
-    return chars.map(c => <CharData>[0, c, 1, c.charCodeAt(0)]);
+  function stringArrayToRow(chars: string[]): IBufferLine {
+    const line = new BufferLine(chars.length);
+    chars.map((c, idx) => line.setCell(idx, CellData.fromCharData([0, c, 1, c.charCodeAt(0)])));
+    return line;
   }
 
   describe('_selectWordAt', () => {
@@ -95,7 +102,7 @@ describe('SelectionManager', () => {
     });
     it('should expand selection for wide characters', () => {
       // Wide characters use a special format
-      buffer.lines.set(0, [
+      const data: [number, string, number, number][] = [
         [null, '中', 2, '中'.charCodeAt(0)],
         [null, '', 0, null],
         [null, '文', 2, '文'.charCodeAt(0)],
@@ -111,7 +118,10 @@ describe('SelectionManager', () => {
         [null, 'f', 1, 'f'.charCodeAt(0)],
         [null, 'o', 1, 'o'.charCodeAt(0)],
         [null, 'o', 1, 'o'.charCodeAt(0)]
-      ]);
+      ];
+      const line = new BufferLine(data.length);
+      for (let i = 0; i < data.length; ++i) line.setCell(i, CellData.fromCharData(data[i]));
+      buffer.lines.set(0, line);
       // Ensure wide characters take up 2 columns
       selectionManager.selectWordAt([0, 0]);
       assert.equal(selectionManager.selectionText, '中文');
@@ -180,6 +190,42 @@ describe('SelectionManager', () => {
       assert.equal(selectionManager.selectionText, 'ij');
       selectionManager.selectWordAt([15, 0]);
       assert.equal(selectionManager.selectionText, 'ij"');
+    });
+    it('should expand upwards or downards for wrapped lines', () => {
+      buffer.lines.set(0, stringToRow('                                                                             foo'));
+      buffer.lines.set(1, stringToRow('bar                                                                             '));
+      buffer.lines.get(1).isWrapped = true;
+      selectionManager.selectWordAt([1, 1]);
+      assert.equal(selectionManager.selectionText, 'foobar');
+      selectionManager.model.clearSelection();
+      selectionManager.selectWordAt([78, 0]);
+      assert.equal(selectionManager.selectionText, 'foobar');
+    });
+    it('should expand both upwards and downwards for word wrapped over many lines', () => {
+      const expectedText = 'fooaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccbar';
+      buffer.lines.set(0, stringToRow('                                                                             foo'));
+      buffer.lines.set(1, stringToRow('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'));
+      buffer.lines.set(2, stringToRow('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'));
+      buffer.lines.set(3, stringToRow('cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc'));
+      buffer.lines.set(4, stringToRow('bar                                                                             '));
+      buffer.lines.get(1).isWrapped = true;
+      buffer.lines.get(2).isWrapped = true;
+      buffer.lines.get(3).isWrapped = true;
+      buffer.lines.get(4).isWrapped = true;
+      selectionManager.selectWordAt([78, 0]);
+      assert.equal(selectionManager.selectionText, expectedText);
+      selectionManager.model.clearSelection();
+      selectionManager.selectWordAt([40, 1]);
+      assert.equal(selectionManager.selectionText, expectedText);
+      selectionManager.model.clearSelection();
+      selectionManager.selectWordAt([40, 2]);
+      assert.equal(selectionManager.selectionText, expectedText);
+      selectionManager.model.clearSelection();
+      selectionManager.selectWordAt([40, 3]);
+      assert.equal(selectionManager.selectionText, expectedText);
+      selectionManager.model.clearSelection();
+      selectionManager.selectWordAt([1, 4]);
+      assert.equal(selectionManager.selectionText, expectedText);
     });
     describe('emoji', () => {
       it('should treat a single emoji as a word when wrapped in spaces', () => {
@@ -298,6 +344,16 @@ describe('SelectionManager', () => {
       assert.deepEqual(selectionManager.model.finalSelectionStart, [0, 0]);
       assert.deepEqual(selectionManager.model.finalSelectionEnd, [terminal.cols, 0], 'The actual selection spans the entire column');
     });
+    it('should select the entire wrapped line', () => {
+      buffer.lines.set(0, stringToRow('foo'));
+      const line2 = stringToRow('bar');
+      line2.isWrapped = true;
+      buffer.lines.set(1, line2);
+      selectionManager.selectLineAt(0);
+      assert.equal(selectionManager.selectionText, 'foobar', 'The selected text is correct');
+      assert.deepEqual(selectionManager.model.finalSelectionStart, [0, 0]);
+      assert.deepEqual(selectionManager.model.finalSelectionEnd, [terminal.cols, 1], 'The actual selection spans the entire column');
+    });
   });
 
   describe('selectAll', () => {
@@ -368,4 +424,73 @@ describe('SelectionManager', () => {
       assert.equal(selectionManager.hasSelection, true);
     });
   });
+
+  describe('column selection', () => {
+    it('should select a column of text', () => {
+      buffer.lines.length = 3;
+      buffer.lines.set(0, stringToRow('abcdefghij'));
+      buffer.lines.set(1, stringToRow('klmnopqrst'));
+      buffer.lines.set(2, stringToRow('uvwxyz'));
+
+      selectionManager.selectionMode = SelectionMode.COLUMN;
+      selectionManager.model.selectionStart = [2, 0];
+      selectionManager.model.selectionEnd = [4, 2];
+
+      assert.equal(selectionManager.selectionText, 'cd\nmn\nwx');
+    });
+
+    it('should select a column of text without chopping up double width characters', () => {
+      buffer.lines.length = 3;
+      buffer.lines.set(0, stringToRow('a'));
+      buffer.lines.set(1, stringToRow('語'));
+      buffer.lines.set(2, stringToRow('b'));
+
+      selectionManager.selectionMode = SelectionMode.COLUMN;
+      selectionManager.model.selectionStart = [0, 0];
+      selectionManager.model.selectionEnd = [1, 2];
+
+      assert.equal(selectionManager.selectionText, 'a\n語\nb');
+    });
+
+    it('should select a column of text with single character emojis', () => {
+      buffer.lines.length = 3;
+      buffer.lines.set(0, stringToRow('a'));
+      buffer.lines.set(1, stringToRow('☃'));
+      buffer.lines.set(2, stringToRow('c'));
+
+      selectionManager.selectionMode = SelectionMode.COLUMN;
+      selectionManager.model.selectionStart = [0, 0];
+      selectionManager.model.selectionEnd = [1, 2];
+
+      assert.equal(selectionManager.selectionText, 'a\n☃\nc');
+    });
+
+    it('should select a column of text with double character emojis', () => {
+      // TODO the case this is testing works for me in the demo webapp,
+      // but doing it programmatically fails.
+      buffer.lines.length = 3;
+      buffer.lines.set(0, stringToRow('a '));
+      buffer.lines.set(1, stringArrayToRow(['😁', ' ']));
+      buffer.lines.set(2, stringToRow('c '));
+
+      selectionManager.selectionMode = SelectionMode.COLUMN;
+      selectionManager.model.selectionStart = [0, 0];
+      selectionManager.model.selectionEnd = [1, 2];
+
+      assert.equal(selectionManager.selectionText, 'a\n😁\nc');
+    });
+  });
+
+  describe('_areCoordsInSelection', () => {
+    it('should return whether coords are in the selection', () => {
+      assert.isFalse(selectionManager.areCoordsInSelection([0, 0], [2, 0], [2, 1]));
+      assert.isFalse(selectionManager.areCoordsInSelection([1, 0], [2, 0], [2, 1]));
+      assert.isTrue(selectionManager.areCoordsInSelection([2, 0], [2, 0], [2, 1]));
+      assert.isTrue(selectionManager.areCoordsInSelection([10, 0], [2, 0], [2, 1]));
+      assert.isTrue(selectionManager.areCoordsInSelection([0, 1], [2, 0], [2, 1]));
+      assert.isTrue(selectionManager.areCoordsInSelection([1, 1], [2, 0], [2, 1]));
+      assert.isFalse(selectionManager.areCoordsInSelection([2, 1], [2, 0], [2, 1]));
+    });
+  });
 });
+

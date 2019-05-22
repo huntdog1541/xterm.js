@@ -5,9 +5,7 @@
  * Implements the attach method, that attaches the terminal to a WebSocket stream.
  */
 
-/// <reference path="../../../typings/xterm.d.ts"/>
-
-import { Terminal } from 'xterm';
+import { Terminal, IDisposable } from 'xterm';
 import { IAttachAddonTerminal } from './Interfaces';
 
 /**
@@ -38,10 +36,11 @@ export function attach(term: Terminal, socket: WebSocket, bidirectional: boolean
     }
   };
 
-  let myTextDecoder;
+  // TODO: This should be typed but there seem to be issues importing the type
+  let myTextDecoder: any;
 
   addonTerminal.__getMessage = function(ev: MessageEvent): void {
-    let str;
+    let str: string;
 
     if (typeof ev.data === 'object') {
       if (!myTextDecoder) {
@@ -51,10 +50,10 @@ export function attach(term: Terminal, socket: WebSocket, bidirectional: boolean
         str = myTextDecoder.decode(ev.data);
         displayData(str);
       } else {
-        let fileReader = new FileReader();
+        const fileReader = new FileReader();
 
         fileReader.addEventListener('load', () => {
-          str = myTextDecoder.decode(this.result);
+          str = myTextDecoder.decode(fileReader.result);
           displayData(str);
         });
         fileReader.readAsArrayBuffer(ev.data);
@@ -88,14 +87,29 @@ export function attach(term: Terminal, socket: WebSocket, bidirectional: boolean
     socket.send(data);
   };
 
-  socket.addEventListener('message', addonTerminal.__getMessage);
+  addonTerminal._core.register(addSocketListener(socket, 'message', addonTerminal.__getMessage));
 
   if (bidirectional) {
-    addonTerminal.on('data', addonTerminal.__sendData);
+    addonTerminal.__dataListener = addonTerminal.onData(addonTerminal.__sendData);
+    addonTerminal._core.register(addonTerminal.__dataListener);
   }
 
-  socket.addEventListener('close', () => detach(addonTerminal, socket));
-  socket.addEventListener('error', () => detach(addonTerminal, socket));
+  addonTerminal._core.register(addSocketListener(socket, 'close', () => detach(addonTerminal, socket)));
+  addonTerminal._core.register(addSocketListener(socket, 'error', () => detach(addonTerminal, socket)));
+}
+
+function addSocketListener(socket: WebSocket, type: string, handler: (this: WebSocket, ev: Event) => any): IDisposable {
+  socket.addEventListener(type, handler);
+  return {
+    dispose: () => {
+      if (!handler) {
+        // Already disposed
+        return;
+      }
+      socket.removeEventListener(type, handler);
+      handler = null;
+    }
+  };
 }
 
 /**
@@ -106,7 +120,8 @@ export function attach(term: Terminal, socket: WebSocket, bidirectional: boolean
  */
 export function detach(term: Terminal, socket: WebSocket): void {
   const addonTerminal = <IAttachAddonTerminal>term;
-  addonTerminal.off('data', addonTerminal.__sendData);
+  addonTerminal.__dataListener.dispose();
+  addonTerminal.__dataListener = undefined;
 
   socket = (typeof socket === 'undefined') ? addonTerminal.__socket : socket;
 

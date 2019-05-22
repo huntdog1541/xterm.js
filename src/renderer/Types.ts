@@ -3,9 +3,9 @@
  * @license MIT
  */
 
-import { ITerminal } from '../Types';
-import { IEventEmitter, ITheme } from 'xterm';
-import { IColorSet } from '../shared/Types';
+import { ITerminal, CharacterJoinerHandler } from '../Types';
+import { IDisposable } from 'xterm';
+import { IColorSet } from '../ui/Types';
 
 /**
  * Flags used to render terminal text properly.
@@ -20,29 +20,28 @@ export const enum FLAGS {
   ITALIC = 64
 }
 
-export interface IRenderer extends IEventEmitter {
-  dimensions: IRenderDimensions;
-  colorManager: IColorManager;
+/**
+ * Note that IRenderer implementations should emit the refresh event after
+ * rendering rows to the screen.
+ */
+export interface IRenderer extends IDisposable {
+  readonly dimensions: IRenderDimensions;
 
-  setTheme(theme: ITheme): IColorSet;
-  onWindowResize(devicePixelRatio: number): void;
+  dispose(): void;
+  setColors(colors: IColorSet): void;
+  onDevicePixelRatioChange(): void;
   onResize(cols: number, rows: number): void;
   onCharSizeChanged(): void;
   onBlur(): void;
   onFocus(): void;
-  onSelectionChanged(start: [number, number], end: [number, number]): void;
+  onSelectionChanged(start: [number, number], end: [number, number], columnSelectMode: boolean): void;
   onCursorMove(): void;
   onOptionsChanged(): void;
   clear(): void;
-  refreshRows(start: number, end: number): void;
+  renderRows(start: number, end: number): void;
+  registerCharacterJoiner(handler: CharacterJoinerHandler): number;
+  deregisterCharacterJoiner(joinerId: number): boolean;
 }
-
-export interface IColorManager {
-  colors: IColorSet;
-}
-
-// TODO: We should probably rewrite the imports for IColorSet, but there's a lot of them
-export { IColorSet };
 
 export interface IRenderDimensions {
   scaledCharWidth: number;
@@ -59,7 +58,7 @@ export interface IRenderDimensions {
   actualCellHeight: number;
 }
 
-export interface IRenderLayer {
+export interface IRenderLayer extends IDisposable {
   /**
    * Called when the terminal loses focus.
    */
@@ -83,7 +82,7 @@ export interface IRenderLayer {
   /**
    * Called when the theme changes.
    */
-  onThemeChanged(terminal: ITerminal, colorSet: IColorSet): void;
+  setColors(terminal: ITerminal, colorSet: IColorSet): void;
 
   /**
    * Called when the data in the grid has changed (or needs to be rendered
@@ -94,7 +93,17 @@ export interface IRenderLayer {
   /**
    * Calls when the selection changes.
    */
-  onSelectionChanged(terminal: ITerminal, start: [number, number], end: [number, number]): void;
+  onSelectionChanged(terminal: ITerminal, start: [number, number], end: [number, number], columnSelectMode: boolean): void;
+
+  /**
+   * Registers a handler to join characters to render as a group
+   */
+  registerCharacterJoiner?(joiner: ICharacterJoiner): void;
+
+  /**
+   * Deregisters the specified character joiner handler
+   */
+  deregisterCharacterJoiner?(joinerId: number): void;
 
   /**
    * Resize the render layer.
@@ -105,4 +114,15 @@ export interface IRenderLayer {
    * Clear the state of the render layer.
    */
   reset(terminal: ITerminal): void;
+}
+
+export interface ICharacterJoiner {
+  id: number;
+  handler: CharacterJoinerHandler;
+}
+
+export interface ICharacterJoinerRegistry {
+  registerCharacterJoiner(handler: (text: string) => [number, number][]): number;
+  deregisterCharacterJoiner(joinerId: number): boolean;
+  getJoinedCharacters(row: number): [number, number][];
 }

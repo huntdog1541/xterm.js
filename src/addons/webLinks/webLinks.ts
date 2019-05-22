@@ -3,8 +3,6 @@
  * @license MIT
  */
 
-/// <reference path="../../../typings/xterm.d.ts"/>
-
 import { Terminal, ILinkMatcherOptions } from 'xterm';
 
 const protocolClause = '(https?:\\/\\/)';
@@ -16,7 +14,8 @@ const ipClause = '((\\d{1,3}\\.){3}\\d{1,3})';
 const localHostClause = '(localhost)';
 const portClause = '(:\\d{1,5})';
 const hostClause = '((' + domainBodyClause + '\\.' + tldClause + ')|' + ipClause + '|' + localHostClause + ')' + portClause + '?';
-const pathClause = '(\\/[\\/\\w\\.\\-%~]*)*';
+const pathCharacterSet = '(\\/[\\/\\w\\.\\-%~:+]*)*([^:"\'\\s])';
+const pathClause = '(' + pathCharacterSet + ')?';
 const queryStringHashFragmentCharacterSet = '[0-9\\w\\[\\]\\(\\)\\/\\?\\!#@$%&\'*+,:;~\\=\\.\\-]*';
 const queryStringClause = '(\\?' + queryStringHashFragmentCharacterSet + ')?';
 const hashFragmentClause = '(#' + queryStringHashFragmentCharacterSet + ')?';

@@ -5,20 +5,18 @@
 
 import { assert, expect } from 'chai';
 import { Terminal } from './Terminal';
-import * as attach from './addons/attach/attach';
-import { MockViewport, MockCompositionHelper, MockRenderer } from './utils/TestUtils.test';
-import { CHAR_DATA_CHAR_INDEX, CHAR_DATA_WIDTH_INDEX } from './Buffer';
+import { MockViewport, MockCompositionHelper, MockRenderer } from './TestUtils.test';
+import { CellData, DEFAULT_ATTR_DATA } from './core/buffer/BufferLine';
 
 const INIT_COLS = 80;
 const INIT_ROWS = 24;
 
 class TestTerminal extends Terminal {
-  public evaluateKeyEscapeSequence(ev: any): {cancel: boolean, key: string, scrollLines: number} { return this._evaluateKeyEscapeSequence(<KeyboardEvent>ev); }
   public keyDown(ev: any): boolean { return this._keyDown(ev); }
   public keyPress(ev: any): boolean { return this._keyPress(ev); }
 }
 
-describe('term.js addons', () => {
+describe('Terminal', () => {
   let term: TestTerminal;
   const termOptions = {
     cols: INIT_COLS,
@@ -27,7 +25,7 @@ describe('term.js addons', () => {
 
   beforeEach(() => {
     term = new TestTerminal(termOptions);
-    term.refresh = () => {};
+    term.refresh = () => { };
     (<any>term).renderer = new MockRenderer();
     term.viewport = new MockViewport();
     (<any>term)._compositionHelper = new MockCompositionHelper();
@@ -38,8 +36,8 @@ describe('term.js addons', () => {
     };
     (<any>term).element = {
       classList: {
-        toggle: () => {},
-        remove: () => {}
+        toggle: () => { },
+        remove: () => { }
       }
     };
   });
@@ -51,13 +49,6 @@ describe('term.js addons', () => {
       cols: INIT_COLS,
       rows: INIT_ROWS
     });
-  });
-
-  it('should apply addons with Terminal.applyAddon', () => {
-    Terminal.applyAddon(attach);
-    // Test that addon was applied successfully, adding attach to Terminal's
-    // prototype.
-    assert.equal(typeof (<any>Terminal).prototype.attach, 'function');
   });
 
   describe('getOption', () => {
@@ -76,24 +67,251 @@ describe('term.js addons', () => {
     });
   });
 
+  describe('events', () => {
+    it('should fire the onData evnet', (done) => {
+      term.onData(() => done());
+      term.handler('fake');
+    });
+    it('should fire the onCursorMove event', (done) => {
+      term.on('cursormove', () => done());
+      term.write('foo');
+    });
+    it('should fire the onLineFeed event', (done) => {
+      term.on('linefeed', () => done());
+      term.write('\n');
+    });
+    it('should fire a scroll event when scrollback is created', (done) => {
+      term.on('scroll', () => done());
+      term.write('\n'.repeat(INIT_ROWS));
+    });
+    it('should fire a scroll event when scrollback is cleared', (done) => {
+      term.write('\n'.repeat(INIT_ROWS));
+      term.on('scroll', () => done());
+      term.clear();
+    });
+    it('should fire a key event after a keypress DOM event', (done) => {
+      term.onKey(e => {
+        assert.equal(typeof e.key, 'string');
+        expect(e.domEvent).to.be.an.instanceof(Object);
+        done();
+      });
+      const evKeyPress = <KeyboardEvent>{
+        preventDefault: () => { },
+        stopPropagation: () => { },
+        type: 'keypress',
+        keyCode: 13
+      };
+      term.keyPress(evKeyPress);
+    });
+    it('should fire a key event after a keydown DOM event', (done) => {
+      term.onKey(e => {
+        assert.equal(typeof e.key, 'string');
+        expect(e.domEvent).to.be.an.instanceof(Object);
+        done();
+      });
+      const evKeyDown = <KeyboardEvent>{
+        preventDefault: () => { },
+        stopPropagation: () => { },
+        type: 'keydown',
+        keyCode: 13
+      };
+      term.keyDown(evKeyDown);
+    });
+    it('should fire the onResize event', (done) => {
+      term.onResize(e => {
+        expect(e).to.have.keys(['cols', 'rows']);
+        assert.equal(typeof e.cols, 'number');
+        assert.equal(typeof e.rows, 'number');
+        done();
+      });
+      term.resize(1, 1);
+    });
+    it('should fire the onScroll event', (done) => {
+      term.onScroll(e => {
+        assert.equal(typeof e, 'number');
+        done();
+      });
+      term.scroll();
+    });
+    it('should fire the onTitleChange event', (done) => {
+      term.onTitleChange(e => {
+        assert.equal(e, 'title');
+        done();
+      });
+      term.handleTitle('title');
+    });
+  });
+
+  describe('on', () => {
+    beforeEach(() => {
+      term.on('key', () => { });
+      term.on('keypress', () => { });
+      term.on('keydown', () => { });
+    });
+
+    describe('data', () => {
+      it('should emit a data event', (done) => {
+        term.on('data', () => {
+          done();
+        });
+
+        term.handler('fake');
+      });
+    });
+
+    describe('cursormove', () => {
+      it('should emit a cursormove event', (done) => {
+        term.on('cursormove', () => {
+          done();
+        });
+        term.write('foo');
+      });
+    });
+
+    describe('linefeed', () => {
+      it('should emit a linefeed event', (done) => {
+        term.on('linefeed', () => {
+          done();
+        });
+        term.write('\n');
+      });
+    });
+
+    describe('scroll', () => {
+      it('should emit a scroll event when scrollback is created', (done) => {
+        term.on('scroll', () => {
+          done();
+        });
+        term.write('\n'.repeat(INIT_ROWS));
+      });
+      it('should emit a scroll event when scrollback is cleared', (done) => {
+        term.write('\n'.repeat(INIT_ROWS));
+        term.on('scroll', () => {
+          done();
+        });
+        term.clear();
+      });
+    });
+
+    describe(`keypress (including 'key' event)`, () => {
+      it('should receive a string and event object', (done) => {
+        let steps = 0;
+
+        const finish = () => {
+          if ((++steps) === 2) {
+            done();
+          }
+        };
+
+        const evKeyPress = <KeyboardEvent>{
+          preventDefault: () => { },
+          stopPropagation: () => { },
+          type: 'keypress',
+          keyCode: 13
+        };
+
+        term.on('keypress', (key, event) => {
+          assert.equal(typeof key, 'string');
+          expect(event).to.be.an.instanceof(Object);
+          finish();
+        });
+
+        term.on('key', (key, event) => {
+          assert.equal(typeof key, 'string');
+          expect(event).to.be.an.instanceof(Object);
+          finish();
+        });
+
+        term.keyPress(evKeyPress);
+      });
+    });
+
+    describe(`keydown (including 'key' event)`, () => {
+      it(`should receive an event object for 'keydown' and a string and event object for 'key'`, (done) => {
+        let steps = 0;
+
+        const finish = () => {
+          if ((++steps) === 2) {
+            done();
+          }
+        };
+
+        const evKeyDown = <KeyboardEvent>{
+          preventDefault: () => { },
+          stopPropagation: () => { },
+          type: 'keydown',
+          keyCode: 13
+        };
+
+        term.on('keydown', (event) => {
+          expect(event).to.be.an.instanceof(Object);
+          finish();
+        });
+
+        term.on('key', (key, event) => {
+          assert.equal(typeof key, 'string');
+          expect(event).to.be.an.instanceof(Object);
+          finish();
+        });
+
+        term.keyDown(evKeyDown);
+      });
+    });
+
+    describe('resize', () => {
+      it('should receive an object: {cols: number, rows: number}', (done) => {
+        term.on('resize', (data) => {
+          expect(data).to.have.keys(['cols', 'rows']);
+          assert.equal(typeof data.cols, 'number');
+          assert.equal(typeof data.rows, 'number');
+          done();
+        });
+
+        term.resize(1, 1);
+      });
+    });
+
+    describe('scroll', () => {
+      it('should receive a number', (done) => {
+        term.on('scroll', (ydisp) => {
+          assert.equal(typeof ydisp, 'number');
+          done();
+        });
+
+        term.scroll();
+      });
+    });
+
+    describe('title', () => {
+      it('should receive a string', (done) => {
+        term.on('title', (title) => {
+          assert.equal(typeof title, 'string');
+          done();
+        });
+
+        term.handleTitle('title');
+      });
+    });
+  });
+
   describe('attachCustomKeyEventHandler', () => {
-    let evKeyDown = <KeyboardEvent>{
-      preventDefault: () => {},
-      stopPropagation: () => {},
+    const evKeyDown = <KeyboardEvent>{
+      preventDefault: () => { },
+      stopPropagation: () => { },
       type: 'keydown',
       keyCode: 77
     };
-    let evKeyPress = <KeyboardEvent>{
-      preventDefault: () => {},
-      stopPropagation: () => {},
+    const evKeyPress = <KeyboardEvent>{
+      preventDefault: () => { },
+      stopPropagation: () => { },
       type: 'keypress',
       keyCode: 77
     };
 
     beforeEach(() => {
-      term.handler = () => {};
-      term.showCursor = () => {};
-      term.clearSelection = () => {};
+      term.handler = () => { };
+      term.showCursor = () => { };
+      term.clearSelection = () => { };
     });
 
     it('should process the keydown/keypress event based on what the handler returns', () => {
@@ -118,7 +336,7 @@ describe('term.js addons', () => {
   });
 
   describe('setOption', () => {
-    it('should set the option correctly', () => {
+    it('should set option correctly', () => {
       term.setOption('cursorBlink', true);
       assert.equal(term.options.cursorBlink, true);
       term.setOption('cursorBlink', false);
@@ -129,9 +347,20 @@ describe('term.js addons', () => {
     });
   });
 
+  describe('reset', () => {
+    it('should not affect cursorState', () => {
+      term.cursorState = 1;
+      term.reset();
+      assert.equal(term.cursorState, 1);
+      term.cursorState = 0;
+      term.reset();
+      assert.equal(term.cursorState, 0);
+    });
+  });
+
   describe('clear', () => {
     it('should clear a buffer equal to rows', () => {
-      let promptLine = term.buffer.lines.get(term.buffer.ybase + term.buffer.y);
+      const promptLine = term.buffer.lines.get(term.buffer.ybase + term.buffer.y);
       term.clear();
       assert.equal(term.buffer.y, 0);
       assert.equal(term.buffer.ybase, 0);
@@ -139,7 +368,7 @@ describe('term.js addons', () => {
       assert.equal(term.buffer.lines.length, term.rows);
       assert.deepEqual(term.buffer.lines.get(0), promptLine);
       for (let i = 1; i < term.rows; i++) {
-        assert.deepEqual(term.buffer.lines.get(i), term.blankLine());
+        assert.deepEqual(term.buffer.lines.get(i), term.buffer.getBlankLine(DEFAULT_ATTR_DATA));
       }
     });
     it('should clear a buffer larger than rows', () => {
@@ -148,7 +377,7 @@ describe('term.js addons', () => {
         term.write('test\n');
       }
 
-      let promptLine = term.buffer.lines.get(term.buffer.ybase + term.buffer.y);
+      const promptLine = term.buffer.lines.get(term.buffer.ybase + term.buffer.y);
       term.clear();
       assert.equal(term.buffer.y, 0);
       assert.equal(term.buffer.ybase, 0);
@@ -156,11 +385,11 @@ describe('term.js addons', () => {
       assert.equal(term.buffer.lines.length, term.rows);
       assert.deepEqual(term.buffer.lines.get(0), promptLine);
       for (let i = 1; i < term.rows; i++) {
-        assert.deepEqual(term.buffer.lines.get(i), term.blankLine());
+        assert.deepEqual(term.buffer.lines.get(i), term.buffer.getBlankLine(DEFAULT_ATTR_DATA));
       }
     });
     it('should not break the prompt when cleared twice', () => {
-      let promptLine = term.buffer.lines.get(term.buffer.ybase + term.buffer.y);
+      const promptLine = term.buffer.lines.get(term.buffer.ybase + term.buffer.y);
       term.clear();
       term.clear();
       assert.equal(term.buffer.y, 0);
@@ -169,14 +398,14 @@ describe('term.js addons', () => {
       assert.equal(term.buffer.lines.length, term.rows);
       assert.deepEqual(term.buffer.lines.get(0), promptLine);
       for (let i = 1; i < term.rows; i++) {
-        assert.deepEqual(term.buffer.lines.get(i), term.blankLine());
+        assert.deepEqual(term.buffer.lines.get(i), term.buffer.getBlankLine(DEFAULT_ATTR_DATA));
       }
     });
   });
 
   describe('scroll', () => {
     describe('scrollLines', () => {
-      let startYDisp;
+      let startYDisp: number;
       beforeEach(() => {
         for (let i = 0; i < term.rows * 2; i++) {
           term.writeln('test');
@@ -211,7 +440,7 @@ describe('term.js addons', () => {
     });
 
     describe('scrollPages', () => {
-      let startYDisp;
+      let startYDisp: number;
       beforeEach(() => {
         for (let i = 0; i < term.rows * 3; i++) {
           term.writeln('test');
@@ -248,7 +477,7 @@ describe('term.js addons', () => {
     });
 
     describe('scrollToBottom', () => {
-      let startYDisp;
+      let startYDisp: number;
       beforeEach(() => {
         for (let i = 0; i < term.rows * 3; i++) {
           term.writeln('test');
@@ -269,7 +498,7 @@ describe('term.js addons', () => {
     });
 
     describe('scrollToLine', () => {
-      let startYDisp;
+      let startYDisp: number;
       beforeEach(() => {
         for (let i = 0; i < term.rows * 3; i++) {
           term.writeln('test');
@@ -296,22 +525,19 @@ describe('term.js addons', () => {
       });
     });
 
-    describe('keyDown', () => {
+    describe('keyPress', () => {
       it('should scroll down, when a key is pressed and terminal is scrolled up', () => {
-        // Override _evaluateKeyEscapeSequence to return cancel code
-        (<any>term)._evaluateKeyEscapeSequence = () => {
-          return { key: 'a' };
-        };
-        let event = <KeyboardEvent>{
+        const event = <KeyboardEvent>{
           type: 'keydown',
-          keyCode: 0,
-          preventDefault: () => {},
-          stopPropagation: () => {}
+          key: 'a',
+          keyCode: 65,
+          preventDefault: () => { },
+          stopPropagation: () => { }
         };
 
         term.buffer.ydisp = 0;
         term.buffer.ybase = 40;
-        term.keyDown(event);
+        term.keyPress(event);
 
         // Ensure that now the terminal is scrolled to bottom
         assert.equal(term.buffer.ydisp, term.buffer.ybase);
@@ -322,7 +548,7 @@ describe('term.js addons', () => {
         for (let i = 0; i < term.rows * 3; i++) {
           term.writeln('test');
         }
-        let startYDisp = (term.rows * 2) + 1;
+        const startYDisp = (term.rows * 2) + 1;
         term.attachCustomKeyEventHandler(() => {
           return false;
         });
@@ -330,7 +556,7 @@ describe('term.js addons', () => {
         assert.equal(term.buffer.ydisp, startYDisp);
         term.scrollLines(-1);
         assert.equal(term.buffer.ydisp, startYDisp - 1);
-        term.keyDown(<KeyboardEvent>{ keyCode: 0 });
+        term.keyPress(<KeyboardEvent>{ keyCode: 0 });
         assert.equal(term.buffer.ydisp, startYDisp - 1);
       });
     });
@@ -338,62 +564,62 @@ describe('term.js addons', () => {
     describe('scroll() function', () => {
       describe('when scrollback > 0', () => {
         it('should create a new line and scroll', () => {
-          term.buffer.lines.get(0)[0][CHAR_DATA_CHAR_INDEX] = 'a';
-          term.buffer.lines.get(INIT_ROWS - 1)[0][CHAR_DATA_CHAR_INDEX] = 'b';
+          term.buffer.lines.get(0).setCell(0, CellData.fromCharData([0, 'a', 0, 'a'.charCodeAt(0)]));
+          term.buffer.lines.get(INIT_ROWS - 1).setCell(0, CellData.fromCharData([0, 'b', 0, 'b'.charCodeAt(0)]));
           term.buffer.y = INIT_ROWS - 1; // Move cursor to last line
           term.scroll();
           assert.equal(term.buffer.lines.length, INIT_ROWS + 1);
-          assert.equal(term.buffer.lines.get(0)[0][CHAR_DATA_CHAR_INDEX], 'a');
-          assert.equal(term.buffer.lines.get(INIT_ROWS - 1)[0][CHAR_DATA_CHAR_INDEX], 'b');
-          assert.equal(term.buffer.lines.get(INIT_ROWS)[0][CHAR_DATA_CHAR_INDEX], ' ');
+          assert.equal(term.buffer.lines.get(0).loadCell(0, new CellData()).getChars(), 'a');
+          assert.equal(term.buffer.lines.get(INIT_ROWS - 1).loadCell(0, new CellData()).getChars(), 'b');
+          assert.equal(term.buffer.lines.get(INIT_ROWS).loadCell(0, new CellData()).getChars(), '');
         });
 
         it('should properly scroll inside a scroll region (scrollTop set)', () => {
-          term.buffer.lines.get(0)[0][CHAR_DATA_CHAR_INDEX] = 'a';
-          term.buffer.lines.get(1)[0][CHAR_DATA_CHAR_INDEX] = 'b';
-          term.buffer.lines.get(2)[0][CHAR_DATA_CHAR_INDEX] = 'c';
+          term.buffer.lines.get(0).setCell(0, CellData.fromCharData([0, 'a', 0, 'a'.charCodeAt(0)]));
+          term.buffer.lines.get(1).setCell(0, CellData.fromCharData([0, 'b', 0, 'b'.charCodeAt(0)]));
+          term.buffer.lines.get(2).setCell(0, CellData.fromCharData([0, 'c', 0, 'c'.charCodeAt(0)]));
           term.buffer.y = INIT_ROWS - 1; // Move cursor to last line
           term.buffer.scrollTop = 1;
           term.scroll();
           assert.equal(term.buffer.lines.length, INIT_ROWS);
-          assert.equal(term.buffer.lines.get(0)[0][CHAR_DATA_CHAR_INDEX], 'a');
-          assert.equal(term.buffer.lines.get(1)[0][CHAR_DATA_CHAR_INDEX], 'c');
+          assert.equal(term.buffer.lines.get(0).loadCell(0, new CellData()).getChars(), 'a');
+          assert.equal(term.buffer.lines.get(1).loadCell(0, new CellData()).getChars(), 'c');
         });
 
         it('should properly scroll inside a scroll region (scrollBottom set)', () => {
-          term.buffer.lines.get(0)[0][CHAR_DATA_CHAR_INDEX] = 'a';
-          term.buffer.lines.get(1)[0][CHAR_DATA_CHAR_INDEX] = 'b';
-          term.buffer.lines.get(2)[0][CHAR_DATA_CHAR_INDEX] = 'c';
-          term.buffer.lines.get(3)[0][CHAR_DATA_CHAR_INDEX] = 'd';
-          term.buffer.lines.get(4)[0][CHAR_DATA_CHAR_INDEX] = 'e';
+          term.buffer.lines.get(0).setCell(0, CellData.fromCharData([0, 'a', 0, 'a'.charCodeAt(0)]));
+          term.buffer.lines.get(1).setCell(0, CellData.fromCharData([0, 'b', 0, 'b'.charCodeAt(0)]));
+          term.buffer.lines.get(2).setCell(0, CellData.fromCharData([0, 'c', 0, 'c'.charCodeAt(0)]));
+          term.buffer.lines.get(3).setCell(0, CellData.fromCharData([0, 'd', 0, 'd'.charCodeAt(0)]));
+          term.buffer.lines.get(4).setCell(0, CellData.fromCharData([0, 'e', 0, 'e'.charCodeAt(0)]));
           term.buffer.y = 3;
           term.buffer.scrollBottom = 3;
           term.scroll();
           assert.equal(term.buffer.lines.length, INIT_ROWS + 1);
-          assert.equal(term.buffer.lines.get(0)[0][CHAR_DATA_CHAR_INDEX], 'a', '\'a\' should be pushed to the scrollback');
-          assert.equal(term.buffer.lines.get(1)[0][CHAR_DATA_CHAR_INDEX], 'b');
-          assert.equal(term.buffer.lines.get(2)[0][CHAR_DATA_CHAR_INDEX], 'c');
-          assert.equal(term.buffer.lines.get(3)[0][CHAR_DATA_CHAR_INDEX], 'd');
-          assert.equal(term.buffer.lines.get(4)[0][CHAR_DATA_CHAR_INDEX], ' ', 'a blank line should be added at scrollBottom\'s index');
-          assert.equal(term.buffer.lines.get(5)[0][CHAR_DATA_CHAR_INDEX], 'e');
+          assert.equal(term.buffer.lines.get(0).loadCell(0, new CellData()).getChars(), 'a', '\'a\' should be pushed to the scrollback');
+          assert.equal(term.buffer.lines.get(1).loadCell(0, new CellData()).getChars(), 'b');
+          assert.equal(term.buffer.lines.get(2).loadCell(0, new CellData()).getChars(), 'c');
+          assert.equal(term.buffer.lines.get(3).loadCell(0, new CellData()).getChars(), 'd');
+          assert.equal(term.buffer.lines.get(4).loadCell(0, new CellData()).getChars(), '', 'a blank line should be added at scrollBottom\'s index');
+          assert.equal(term.buffer.lines.get(5).loadCell(0, new CellData()).getChars(), 'e');
         });
 
         it('should properly scroll inside a scroll region (scrollTop and scrollBottom set)', () => {
-          term.buffer.lines.get(0)[0][CHAR_DATA_CHAR_INDEX] = 'a';
-          term.buffer.lines.get(1)[0][CHAR_DATA_CHAR_INDEX] = 'b';
-          term.buffer.lines.get(2)[0][CHAR_DATA_CHAR_INDEX] = 'c';
-          term.buffer.lines.get(3)[0][CHAR_DATA_CHAR_INDEX] = 'd';
-          term.buffer.lines.get(4)[0][CHAR_DATA_CHAR_INDEX] = 'e';
+          term.buffer.lines.get(0).setCell(0, CellData.fromCharData([0, 'a', 0, 'a'.charCodeAt(0)]));
+          term.buffer.lines.get(1).setCell(0, CellData.fromCharData([0, 'b', 0, 'b'.charCodeAt(0)]));
+          term.buffer.lines.get(2).setCell(0, CellData.fromCharData([0, 'c', 0, 'c'.charCodeAt(0)]));
+          term.buffer.lines.get(3).setCell(0, CellData.fromCharData([0, 'd', 0, 'd'.charCodeAt(0)]));
+          term.buffer.lines.get(4).setCell(0, CellData.fromCharData([0, 'e', 0, 'e'.charCodeAt(0)]));
           term.buffer.y = INIT_ROWS - 1; // Move cursor to last line
           term.buffer.scrollTop = 1;
           term.buffer.scrollBottom = 3;
           term.scroll();
           assert.equal(term.buffer.lines.length, INIT_ROWS);
-          assert.equal(term.buffer.lines.get(0)[0][CHAR_DATA_CHAR_INDEX], 'a');
-          assert.equal(term.buffer.lines.get(1)[0][CHAR_DATA_CHAR_INDEX], 'c', '\'b\' should be removed from the buffer');
-          assert.equal(term.buffer.lines.get(2)[0][CHAR_DATA_CHAR_INDEX], 'd');
-          assert.equal(term.buffer.lines.get(3)[0][CHAR_DATA_CHAR_INDEX], ' ', 'a blank line should be added at scrollBottom\'s index');
-          assert.equal(term.buffer.lines.get(4)[0][CHAR_DATA_CHAR_INDEX], 'e');
+          assert.equal(term.buffer.lines.get(0).loadCell(0, new CellData()).getChars(), 'a');
+          assert.equal(term.buffer.lines.get(1).loadCell(0, new CellData()).getChars(), 'c', '\'b\' should be removed from the buffer');
+          assert.equal(term.buffer.lines.get(2).loadCell(0, new CellData()).getChars(), 'd');
+          assert.equal(term.buffer.lines.get(3).loadCell(0, new CellData()).getChars(), '', 'a blank line should be added at scrollBottom\'s index');
+          assert.equal(term.buffer.lines.get(4).loadCell(0, new CellData()).getChars(), 'e');
         });
       });
 
@@ -404,321 +630,78 @@ describe('term.js addons', () => {
         });
 
         it('should create a new line and shift everything up', () => {
-          term.buffer.lines.get(0)[0][CHAR_DATA_CHAR_INDEX] = 'a';
-          term.buffer.lines.get(1)[0][CHAR_DATA_CHAR_INDEX] = 'b';
-          term.buffer.lines.get(INIT_ROWS - 1)[0][CHAR_DATA_CHAR_INDEX] = 'c';
+          term.buffer.lines.get(0).setCell(0, CellData.fromCharData([0, 'a', 0, 'a'.charCodeAt(0)]));
+          term.buffer.lines.get(1).setCell(0, CellData.fromCharData([0, 'b', 0, 'b'.charCodeAt(0)]));
+          term.buffer.lines.get(INIT_ROWS - 1).setCell(0, CellData.fromCharData([0, 'c', 0, 'c'.charCodeAt(0)]));
           term.buffer.y = INIT_ROWS - 1; // Move cursor to last line
           assert.equal(term.buffer.lines.length, INIT_ROWS);
           term.scroll();
           assert.equal(term.buffer.lines.length, INIT_ROWS);
           // 'a' gets pushed out of buffer
-          assert.equal(term.buffer.lines.get(0)[0][CHAR_DATA_CHAR_INDEX], 'b');
-          assert.equal(term.buffer.lines.get(1)[0][CHAR_DATA_CHAR_INDEX], ' ');
-          assert.equal(term.buffer.lines.get(INIT_ROWS - 2)[0][CHAR_DATA_CHAR_INDEX], 'c');
-          assert.equal(term.buffer.lines.get(INIT_ROWS - 1)[0][CHAR_DATA_CHAR_INDEX], ' ');
+          assert.equal(term.buffer.lines.get(0).loadCell(0, new CellData()).getChars(), 'b');
+          assert.equal(term.buffer.lines.get(1).loadCell(0, new CellData()).getChars(), '');
+          assert.equal(term.buffer.lines.get(INIT_ROWS - 2).loadCell(0, new CellData()).getChars(), 'c');
+          assert.equal(term.buffer.lines.get(INIT_ROWS - 1).loadCell(0, new CellData()).getChars(), '');
         });
 
         it('should properly scroll inside a scroll region (scrollTop set)', () => {
-          term.buffer.lines.get(0)[0][CHAR_DATA_CHAR_INDEX] = 'a';
-          term.buffer.lines.get(1)[0][CHAR_DATA_CHAR_INDEX] = 'b';
-          term.buffer.lines.get(2)[0][CHAR_DATA_CHAR_INDEX] = 'c';
+          term.buffer.lines.get(0).setCell(0, CellData.fromCharData([0, 'a', 0, 'a'.charCodeAt(0)]));
+          term.buffer.lines.get(1).setCell(0, CellData.fromCharData([0, 'b', 0, 'b'.charCodeAt(0)]));
+          term.buffer.lines.get(2).setCell(0, CellData.fromCharData([0, 'c', 0, 'c'.charCodeAt(0)]));
           term.buffer.y = INIT_ROWS - 1; // Move cursor to last line
           term.buffer.scrollTop = 1;
           term.scroll();
           assert.equal(term.buffer.lines.length, INIT_ROWS);
-          assert.equal(term.buffer.lines.get(0)[0][CHAR_DATA_CHAR_INDEX], 'a');
-          assert.equal(term.buffer.lines.get(1)[0][CHAR_DATA_CHAR_INDEX], 'c');
+          assert.equal(term.buffer.lines.get(0).loadCell(0, new CellData()).getChars(), 'a');
+          assert.equal(term.buffer.lines.get(1).loadCell(0, new CellData()).getChars(), 'c');
         });
 
         it('should properly scroll inside a scroll region (scrollBottom set)', () => {
-          term.buffer.lines.get(0)[0][CHAR_DATA_CHAR_INDEX] = 'a';
-          term.buffer.lines.get(1)[0][CHAR_DATA_CHAR_INDEX] = 'b';
-          term.buffer.lines.get(2)[0][CHAR_DATA_CHAR_INDEX] = 'c';
-          term.buffer.lines.get(3)[0][CHAR_DATA_CHAR_INDEX] = 'd';
-          term.buffer.lines.get(4)[0][CHAR_DATA_CHAR_INDEX] = 'e';
+          term.buffer.lines.get(0).setCell(0, CellData.fromCharData([0, 'a', 0, 'a'.charCodeAt(0)]));
+          term.buffer.lines.get(1).setCell(0, CellData.fromCharData([0, 'b', 0, 'b'.charCodeAt(0)]));
+          term.buffer.lines.get(2).setCell(0, CellData.fromCharData([0, 'c', 0, 'c'.charCodeAt(0)]));
+          term.buffer.lines.get(3).setCell(0, CellData.fromCharData([0, 'd', 0, 'd'.charCodeAt(0)]));
+          term.buffer.lines.get(4).setCell(0, CellData.fromCharData([0, 'e', 0, 'e'.charCodeAt(0)]));
           term.buffer.y = 3;
           term.buffer.scrollBottom = 3;
           term.scroll();
           assert.equal(term.buffer.lines.length, INIT_ROWS);
-          assert.equal(term.buffer.lines.get(0)[0][CHAR_DATA_CHAR_INDEX], 'b');
-          assert.equal(term.buffer.lines.get(1)[0][CHAR_DATA_CHAR_INDEX], 'c');
-          assert.equal(term.buffer.lines.get(2)[0][CHAR_DATA_CHAR_INDEX], 'd');
-          assert.equal(term.buffer.lines.get(3)[0][CHAR_DATA_CHAR_INDEX], ' ', 'a blank line should be added at scrollBottom\'s index');
-          assert.equal(term.buffer.lines.get(4)[0][CHAR_DATA_CHAR_INDEX], 'e');
+          assert.equal(term.buffer.lines.get(0).loadCell(0, new CellData()).getChars(), 'b');
+          assert.equal(term.buffer.lines.get(1).loadCell(0, new CellData()).getChars(), 'c');
+          assert.equal(term.buffer.lines.get(2).loadCell(0, new CellData()).getChars(), 'd');
+          assert.equal(term.buffer.lines.get(3).loadCell(0, new CellData()).getChars(), '', 'a blank line should be added at scrollBottom\'s index');
+          assert.equal(term.buffer.lines.get(4).loadCell(0, new CellData()).getChars(), 'e');
         });
 
         it('should properly scroll inside a scroll region (scrollTop and scrollBottom set)', () => {
-          term.buffer.lines.get(0)[0][CHAR_DATA_CHAR_INDEX] = 'a';
-          term.buffer.lines.get(1)[0][CHAR_DATA_CHAR_INDEX] = 'b';
-          term.buffer.lines.get(2)[0][CHAR_DATA_CHAR_INDEX] = 'c';
-          term.buffer.lines.get(3)[0][CHAR_DATA_CHAR_INDEX] = 'd';
-          term.buffer.lines.get(4)[0][CHAR_DATA_CHAR_INDEX] = 'e';
+          term.buffer.lines.get(0).setCell(0, CellData.fromCharData([0, 'a', 0, 'a'.charCodeAt(0)]));
+          term.buffer.lines.get(1).setCell(0, CellData.fromCharData([0, 'b', 0, 'b'.charCodeAt(0)]));
+          term.buffer.lines.get(2).setCell(0, CellData.fromCharData([0, 'c', 0, 'c'.charCodeAt(0)]));
+          term.buffer.lines.get(3).setCell(0, CellData.fromCharData([0, 'd', 0, 'd'.charCodeAt(0)]));
+          term.buffer.lines.get(4).setCell(0, CellData.fromCharData([0, 'e', 0, 'e'.charCodeAt(0)]));
           term.buffer.y = INIT_ROWS - 1; // Move cursor to last line
           term.buffer.scrollTop = 1;
           term.buffer.scrollBottom = 3;
           term.scroll();
           assert.equal(term.buffer.lines.length, INIT_ROWS);
-          assert.equal(term.buffer.lines.get(0)[0][CHAR_DATA_CHAR_INDEX], 'a');
-          assert.equal(term.buffer.lines.get(1)[0][CHAR_DATA_CHAR_INDEX], 'c', '\'b\' should be removed from the buffer');
-          assert.equal(term.buffer.lines.get(2)[0][CHAR_DATA_CHAR_INDEX], 'd');
-          assert.equal(term.buffer.lines.get(3)[0][CHAR_DATA_CHAR_INDEX], ' ', 'a blank line should be added at scrollBottom\'s index');
-          assert.equal(term.buffer.lines.get(4)[0][CHAR_DATA_CHAR_INDEX], 'e');
+          assert.equal(term.buffer.lines.get(0).loadCell(0, new CellData()).getChars(), 'a');
+          assert.equal(term.buffer.lines.get(1).loadCell(0, new CellData()).getChars(), 'c', '\'b\' should be removed from the buffer');
+          assert.equal(term.buffer.lines.get(2).loadCell(0, new CellData()).getChars(), 'd');
+          assert.equal(term.buffer.lines.get(3).loadCell(0, new CellData()).getChars(), '', 'a blank line should be added at scrollBottom\'s index');
+          assert.equal(term.buffer.lines.get(4).loadCell(0, new CellData()).getChars(), 'e');
         });
       });
     });
   });
 
-  describe('evaluateKeyEscapeSequence', () => {
-    it('should return the correct escape sequence for unmodified keys', () => {
-      // Backspace
-      assert.equal(term.evaluateKeyEscapeSequence({ keyCode: 8 }).key, '\x7f'); // ^?
-      // Tab
-      assert.equal(term.evaluateKeyEscapeSequence({ keyCode: 9 }).key, '\t');
-      // Return/enter
-      assert.equal(term.evaluateKeyEscapeSequence({ keyCode: 13 }).key, '\r'); // CR
-      // Escape
-      assert.equal(term.evaluateKeyEscapeSequence({ keyCode: 27 }).key, '\x1b');
-      // Page up, page down
-      assert.equal(term.evaluateKeyEscapeSequence({ keyCode: 33 }).key, '\x1b[5~'); // CSI 5 ~
-      assert.equal(term.evaluateKeyEscapeSequence({ keyCode: 34 }).key, '\x1b[6~'); // CSI 6 ~
-      // End, Home
-      assert.equal(term.evaluateKeyEscapeSequence({ keyCode: 35 }).key, '\x1b[F'); // SS3 F
-      assert.equal(term.evaluateKeyEscapeSequence({ keyCode: 36 }).key, '\x1b[H'); // SS3 H
-      // Left, up, right, down arrows
-      assert.equal(term.evaluateKeyEscapeSequence({ keyCode: 37 }).key, '\x1b[D'); // CSI D
-      assert.equal(term.evaluateKeyEscapeSequence({ keyCode: 38 }).key, '\x1b[A'); // CSI A
-      assert.equal(term.evaluateKeyEscapeSequence({ keyCode: 39 }).key, '\x1b[C'); // CSI C
-      assert.equal(term.evaluateKeyEscapeSequence({ keyCode: 40 }).key, '\x1b[B'); // CSI B
-      // Insert
-      assert.equal(term.evaluateKeyEscapeSequence({ keyCode: 45 }).key, '\x1b[2~'); // CSI 2 ~
-      // Delete
-      assert.equal(term.evaluateKeyEscapeSequence({ keyCode: 46 }).key, '\x1b[3~'); // CSI 3 ~
-      // F1-F12
-      assert.equal(term.evaluateKeyEscapeSequence({ keyCode: 112 }).key, '\x1bOP'); // SS3 P
-      assert.equal(term.evaluateKeyEscapeSequence({ keyCode: 113 }).key, '\x1bOQ'); // SS3 Q
-      assert.equal(term.evaluateKeyEscapeSequence({ keyCode: 114 }).key, '\x1bOR'); // SS3 R
-      assert.equal(term.evaluateKeyEscapeSequence({ keyCode: 115 }).key, '\x1bOS'); // SS3 S
-      assert.equal(term.evaluateKeyEscapeSequence({ keyCode: 116 }).key, '\x1b[15~'); // CSI 1 5 ~
-      assert.equal(term.evaluateKeyEscapeSequence({ keyCode: 117 }).key, '\x1b[17~'); // CSI 1 7 ~
-      assert.equal(term.evaluateKeyEscapeSequence({ keyCode: 118 }).key, '\x1b[18~'); // CSI 1 8 ~
-      assert.equal(term.evaluateKeyEscapeSequence({ keyCode: 119 }).key, '\x1b[19~'); // CSI 1 9 ~
-      assert.equal(term.evaluateKeyEscapeSequence({ keyCode: 120 }).key, '\x1b[20~'); // CSI 2 0 ~
-      assert.equal(term.evaluateKeyEscapeSequence({ keyCode: 121 }).key, '\x1b[21~'); // CSI 2 1 ~
-      assert.equal(term.evaluateKeyEscapeSequence({ keyCode: 122 }).key, '\x1b[23~'); // CSI 2 3 ~
-      assert.equal(term.evaluateKeyEscapeSequence({ keyCode: 123 }).key, '\x1b[24~'); // CSI 2 4 ~
-    });
-    it('should return \\x1b[3;5~ for ctrl+delete', () => {
-      assert.equal(term.evaluateKeyEscapeSequence({ ctrlKey: true, keyCode: 46 }).key, '\x1b[3;5~');
-    });
-    it('should return \\x1b[3;2~ for shift+delete', () => {
-      assert.equal(term.evaluateKeyEscapeSequence({ shiftKey: true, keyCode: 46 }).key, '\x1b[3;2~');
-    });
-    it('should return \\x1b[3;3~ for alt+delete', () => {
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, keyCode: 46 }).key, '\x1b[3;3~');
-    });
-    it('should return \\x1b[5D for ctrl+left', () => {
-      assert.equal(term.evaluateKeyEscapeSequence({ ctrlKey: true, keyCode: 37 }).key, '\x1b[1;5D'); // CSI 5 D
-    });
-    it('should return \\x1b[5C for ctrl+right', () => {
-      assert.equal(term.evaluateKeyEscapeSequence({ ctrlKey: true, keyCode: 39 }).key, '\x1b[1;5C'); // CSI 5 C
-    });
-    it('should return \\x1b[5A for ctrl+up', () => {
-      assert.equal(term.evaluateKeyEscapeSequence({ ctrlKey: true, keyCode: 38 }).key, '\x1b[1;5A'); // CSI 5 A
-    });
-    it('should return \\x1b[5B for ctrl+down', () => {
-      assert.equal(term.evaluateKeyEscapeSequence({ ctrlKey: true, keyCode: 40 }).key, '\x1b[1;5B'); // CSI 5 B
-    });
-
-    describe('On non-macOS platforms', () => {
-      beforeEach(() => {
-        term.browser.isMac = false;
-      });
-      // Evalueate alt + arrow key movement, which is a feature of terminal emulators but not VT100
-      // http://unix.stackexchange.com/a/108106
-      it('should return \\x1b[5D for alt+left', () => {
-        assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, keyCode: 37 }).key, '\x1b[1;5D'); // CSI 5 D
-      });
-      it('should return \\x1b[5C for alt+right', () => {
-        assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, keyCode: 39 }).key, '\x1b[1;5C'); // CSI 5 C
-      });
-      it('should return \\x1ba for alt+a', () => {
-        assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, keyCode: 65 }).key, '\x1ba');
-      });
-    });
-
-    describe('On macOS platforms', () => {
-      beforeEach(() => {
-        term.browser.isMac = true;
-      });
-      it('should return \\x1bb for alt+left', () => {
-        assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, keyCode: 37 }).key, '\x1bb'); // CSI 5 D
-      });
-      it('should return \\x1bf for alt+right', () => {
-        assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, keyCode: 39 }).key, '\x1bf'); // CSI 5 C
-      });
-      it('should return undefined for alt+a', () => {
-        assert.strictEqual(term.evaluateKeyEscapeSequence({ altKey: true, keyCode: 65 }).key, undefined);
-      });
-    });
-
-    describe('with macOptionIsMeta', () => {
-      beforeEach(() => {
-        term.browser.isMac = true;
-        term.setOption('macOptionIsMeta', true);
-      });
-      it('should return \\x1ba for alt+a', () => {
-        assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, keyCode: 65 }).key, '\x1ba');
-      });
-    });
-
-    it('should return \\x1b[5A for alt+up', () => {
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, keyCode: 38 }).key, '\x1b[1;5A'); // CSI 5 A
-    });
-    it('should return \\x1b[5B for alt+down', () => {
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, keyCode: 40 }).key, '\x1b[1;5B'); // CSI 5 B
-    });
-    it('should return the correct escape sequence for modified F1-F12 keys', () => {
-      assert.equal(term.evaluateKeyEscapeSequence({ shiftKey: true, keyCode: 112 }).key, '\x1b[1;2P');
-      assert.equal(term.evaluateKeyEscapeSequence({ shiftKey: true, keyCode: 113 }).key, '\x1b[1;2Q');
-      assert.equal(term.evaluateKeyEscapeSequence({ shiftKey: true, keyCode: 114 }).key, '\x1b[1;2R');
-      assert.equal(term.evaluateKeyEscapeSequence({ shiftKey: true, keyCode: 115 }).key, '\x1b[1;2S');
-      assert.equal(term.evaluateKeyEscapeSequence({ shiftKey: true, keyCode: 116 }).key, '\x1b[15;2~');
-      assert.equal(term.evaluateKeyEscapeSequence({ shiftKey: true, keyCode: 117 }).key, '\x1b[17;2~');
-      assert.equal(term.evaluateKeyEscapeSequence({ shiftKey: true, keyCode: 118 }).key, '\x1b[18;2~');
-      assert.equal(term.evaluateKeyEscapeSequence({ shiftKey: true, keyCode: 119 }).key, '\x1b[19;2~');
-      assert.equal(term.evaluateKeyEscapeSequence({ shiftKey: true, keyCode: 120 }).key, '\x1b[20;2~');
-      assert.equal(term.evaluateKeyEscapeSequence({ shiftKey: true, keyCode: 121 }).key, '\x1b[21;2~');
-      assert.equal(term.evaluateKeyEscapeSequence({ shiftKey: true, keyCode: 122 }).key, '\x1b[23;2~');
-      assert.equal(term.evaluateKeyEscapeSequence({ shiftKey: true, keyCode: 123 }).key, '\x1b[24;2~');
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, keyCode: 112 }).key, '\x1b[1;3P');
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, keyCode: 113 }).key, '\x1b[1;3Q');
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, keyCode: 114 }).key, '\x1b[1;3R');
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, keyCode: 115 }).key, '\x1b[1;3S');
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, keyCode: 116 }).key, '\x1b[15;3~');
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, keyCode: 117 }).key, '\x1b[17;3~');
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, keyCode: 118 }).key, '\x1b[18;3~');
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, keyCode: 119 }).key, '\x1b[19;3~');
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, keyCode: 120 }).key, '\x1b[20;3~');
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, keyCode: 121 }).key, '\x1b[21;3~');
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, keyCode: 122 }).key, '\x1b[23;3~');
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, keyCode: 123 }).key, '\x1b[24;3~');
-
-      assert.equal(term.evaluateKeyEscapeSequence({ ctrlKey: true, keyCode: 112 }).key, '\x1b[1;5P');
-      assert.equal(term.evaluateKeyEscapeSequence({ ctrlKey: true, keyCode: 113 }).key, '\x1b[1;5Q');
-      assert.equal(term.evaluateKeyEscapeSequence({ ctrlKey: true, keyCode: 114 }).key, '\x1b[1;5R');
-      assert.equal(term.evaluateKeyEscapeSequence({ ctrlKey: true, keyCode: 115 }).key, '\x1b[1;5S');
-      assert.equal(term.evaluateKeyEscapeSequence({ ctrlKey: true, keyCode: 116 }).key, '\x1b[15;5~');
-      assert.equal(term.evaluateKeyEscapeSequence({ ctrlKey: true, keyCode: 117 }).key, '\x1b[17;5~');
-      assert.equal(term.evaluateKeyEscapeSequence({ ctrlKey: true, keyCode: 118 }).key, '\x1b[18;5~');
-      assert.equal(term.evaluateKeyEscapeSequence({ ctrlKey: true, keyCode: 119 }).key, '\x1b[19;5~');
-      assert.equal(term.evaluateKeyEscapeSequence({ ctrlKey: true, keyCode: 120 }).key, '\x1b[20;5~');
-      assert.equal(term.evaluateKeyEscapeSequence({ ctrlKey: true, keyCode: 121 }).key, '\x1b[21;5~');
-      assert.equal(term.evaluateKeyEscapeSequence({ ctrlKey: true, keyCode: 122 }).key, '\x1b[23;5~');
-      assert.equal(term.evaluateKeyEscapeSequence({ ctrlKey: true, keyCode: 123 }).key, '\x1b[24;5~');
-    });
-
-    // Characters using ctrl+alt sequences
-    it('should return proper sequence for ctrl+alt+a', () => {
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, ctrlKey: true, keyCode: 65 }).key, '\x1b\x01');
-    });
-
-    // Characters using alt sequences (numbers)
-    it('should return proper sequences for alt+0', () => {
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: false, keyCode: 48 }).key, '\x1b0');
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: true,  keyCode: 48 }).key, '\x1b)');
-    });
-    it('should return proper sequences for alt+1', () => {
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: false, keyCode: 49 }).key, '\x1b1');
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: true,  keyCode: 49 }).key, '\x1b!');
-    });
-    it('should return proper sequences for alt+2', () => {
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: false, keyCode: 50 }).key, '\x1b2');
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: true,  keyCode: 50 }).key, '\x1b@');
-    });
-    it('should return proper sequences for alt+3', () => {
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: false, keyCode: 51 }).key, '\x1b3');
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: true,  keyCode: 51 }).key, '\x1b#');
-    });
-    it('should return proper sequences for alt+4', () => {
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: false, keyCode: 52 }).key, '\x1b4');
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: true,  keyCode: 52 }).key, '\x1b$');
-    });
-    it('should return proper sequences for alt+5', () => {
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: false, keyCode: 53 }).key, '\x1b5');
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: true,  keyCode: 53 }).key, '\x1b%');
-    });
-    it('should return proper sequences for alt+6', () => {
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: false, keyCode: 54 }).key, '\x1b6');
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: true,  keyCode: 54 }).key, '\x1b^');
-    });
-    it('should return proper sequences for alt+7', () => {
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: false, keyCode: 55 }).key, '\x1b7');
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: true,  keyCode: 55 }).key, '\x1b&');
-    });
-    it('should return proper sequences for alt+8', () => {
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: false, keyCode: 56 }).key, '\x1b8');
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: true,  keyCode: 56 }).key, '\x1b*');
-    });
-    it('should return proper sequences for alt+9', () => {
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: false, keyCode: 57 }).key, '\x1b9');
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: true,  keyCode: 57 }).key, '\x1b(');
-    });
-
-    // Characters using alt sequences (special chars)
-    it('should return proper sequences for alt+;', () => {
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: false, keyCode: 186 }).key, '\x1b;');
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: true,  keyCode: 186 }).key, '\x1b:');
-    });
-    it('should return proper sequences for alt+=', () => {
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: false, keyCode: 187 }).key, '\x1b=');
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: true,  keyCode: 187 }).key, '\x1b+');
-    });
-    it('should return proper sequences for alt+,', () => {
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: false, keyCode: 188 }).key, '\x1b,');
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: true,  keyCode: 188 }).key, '\x1b<');
-    });
-    it('should return proper sequences for alt+-', () => {
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: false, keyCode: 189 }).key, '\x1b-');
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: true,  keyCode: 189 }).key, '\x1b_');
-    });
-    it('should return proper sequences for alt+.', () => {
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: false, keyCode: 190 }).key, '\x1b.');
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: true,  keyCode: 190 }).key, '\x1b>');
-    });
-    it('should return proper sequences for alt+/', () => {
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: false, keyCode: 191 }).key, '\x1b/');
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: true, keyCode: 191 }).key, '\x1b?');
-    });
-    it('should return proper sequences for alt+~', () => {
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: false, keyCode: 192 }).key, '\x1b`');
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: true, keyCode: 192 }).key, '\x1b~');
-    });
-    it('should return proper sequences for alt+[', () => {
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: false, keyCode: 219 }).key, '\x1b[');
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: true,  keyCode: 219 }).key, '\x1b{');
-    });
-    it('should return proper sequences for alt+\\', () => {
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: false, keyCode: 220 }).key, '\x1b\\');
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: true,  keyCode: 220 }).key, '\x1b|');
-    });
-    it('should return proper sequences for alt+]', () => {
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: false, keyCode: 221 }).key, '\x1b]');
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: true,  keyCode: 221 }).key, '\x1b}');
-    });
-    it('should return proper sequences for alt+\'', () => {
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: false, keyCode: 222 }).key, '\x1b\'');
-      assert.equal(term.evaluateKeyEscapeSequence({ altKey: true, shiftKey: true,  keyCode: 222 }).key, '\x1b"');
-    });
-  });
-
   describe('Third level shift', () => {
-    let evKeyDown;
-    let evKeyPress;
+    let evKeyDown: any;
+    let evKeyPress: any;
 
     beforeEach(() => {
-      term.handler = () => {};
-      term.showCursor = () => {};
-      term.clearSelection = () => {};
+      term.handler = () => { };
+      term.showCursor = () => { };
+      term.clearSelection = () => { };
       // term.compositionHelper = {
       //   isComposing: false,
       //   keydown: {
@@ -728,15 +711,15 @@ describe('term.js addons', () => {
       //   }
       // };
       evKeyDown = {
-        preventDefault: () => {},
-        stopPropagation: () => {},
+        preventDefault: () => { },
+        stopPropagation: () => { },
         type: 'keydown',
         altKey: null,
         keyCode: null
       };
       evKeyPress = {
-        preventDefault: () => {},
-        stopPropagation: () => {},
+        preventDefault: () => { },
+        stopPropagation: () => { },
         type: 'keypress',
         altKey: null,
         charCode: null,
@@ -784,11 +767,11 @@ describe('term.js addons', () => {
       });
 
       it('should emit key with alt + key on keyPress', (done) => {
-        let keys = ['@', '@', '\\', '\\', '|', '|'];
+        const keys = ['@', '@', '\\', '\\', '|', '|'];
 
         term.on('keypress', (key) => {
           if (key) {
-            let index = keys.indexOf(key);
+            const index = keys.indexOf(key);
             assert(index !== -1, 'Emitted wrong key: ' + key);
             keys.splice(index, 1);
           }
@@ -850,11 +833,11 @@ describe('term.js addons', () => {
       });
 
       it('should emit key with alt + ctrl + key on keyPress', (done) => {
-        let keys = ['@', '@', '\\', '\\', '|', '|'];
+        const keys = ['@', '@', '\\', '\\', '|', '|'];
 
         term.on('keypress', (key) => {
           if (key) {
-            let index = keys.indexOf(key);
+            const index = keys.indexOf(key);
             assert(index !== -1, 'Emitted wrong key: ' + key);
             keys.splice(index, 1);
           }
@@ -895,117 +878,127 @@ describe('term.js addons', () => {
   describe('unicode - surrogates', () => {
     it('2 characters per cell', function (): void {
       this.timeout(10000);  // This is needed because istanbul patches code and slows it down
-      let high = String.fromCharCode(0xD800);
+      const high = String.fromCharCode(0xD800);
+      const cell = new CellData();
       for (let i = 0xDC00; i <= 0xDCFF; ++i) {
         term.write(high + String.fromCharCode(i));
-        let tchar = term.buffer.lines.get(0)[0];
-        expect(tchar[CHAR_DATA_CHAR_INDEX]).eql(high + String.fromCharCode(i));
-        expect(tchar[CHAR_DATA_CHAR_INDEX].length).eql(2);
-        expect(tchar[CHAR_DATA_WIDTH_INDEX]).eql(1);
-        expect(term.buffer.lines.get(0)[1][CHAR_DATA_CHAR_INDEX]).eql(' ');
+        const tchar = term.buffer.lines.get(0).loadCell(0, cell);
+        expect(tchar.getChars()).eql(high + String.fromCharCode(i));
+        expect(tchar.getChars().length).eql(2);
+        expect(tchar.getWidth()).eql(1);
+        expect(term.buffer.lines.get(0).loadCell(1, cell).getChars()).eql('');
         term.reset();
       }
     });
     it('2 characters at last cell', () => {
-      let high = String.fromCharCode(0xD800);
+      const high = String.fromCharCode(0xD800);
+      const cell = new CellData();
       for (let i = 0xDC00; i <= 0xDCFF; ++i) {
         term.buffer.x = term.cols - 1;
         term.write(high + String.fromCharCode(i));
-        expect(term.buffer.lines.get(0)[term.buffer.x - 1][CHAR_DATA_CHAR_INDEX]).eql(high + String.fromCharCode(i));
-        expect(term.buffer.lines.get(0)[term.buffer.x - 1][CHAR_DATA_CHAR_INDEX].length).eql(2);
-        expect(term.buffer.lines.get(1)[0][CHAR_DATA_CHAR_INDEX]).eql(' ');
+        expect(term.buffer.lines.get(0).loadCell(term.buffer.x - 1, cell).getChars()).eql(high + String.fromCharCode(i));
+        expect(term.buffer.lines.get(0).loadCell(term.buffer.x - 1, cell).getChars().length).eql(2);
+        expect(term.buffer.lines.get(1).loadCell(0, cell).getChars()).eql('');
         term.reset();
       }
     });
     it('2 characters per cell over line end with autowrap', () => {
-      let high = String.fromCharCode(0xD800);
+      const high = String.fromCharCode(0xD800);
+      const cell = new CellData();
       for (let i = 0xDC00; i <= 0xDCFF; ++i) {
         term.buffer.x = term.cols - 1;
         term.wraparoundMode = true;
         term.write('a' + high + String.fromCharCode(i));
-        expect(term.buffer.lines.get(0)[term.cols - 1][CHAR_DATA_CHAR_INDEX]).eql('a');
-        expect(term.buffer.lines.get(1)[0][CHAR_DATA_CHAR_INDEX]).eql(high + String.fromCharCode(i));
-        expect(term.buffer.lines.get(1)[0][CHAR_DATA_CHAR_INDEX].length).eql(2);
-        expect(term.buffer.lines.get(1)[1][CHAR_DATA_CHAR_INDEX]).eql(' ');
+        expect(term.buffer.lines.get(0).loadCell(term.cols - 1, cell).getChars()).eql('a');
+        expect(term.buffer.lines.get(1).loadCell(0, cell).getChars()).eql(high + String.fromCharCode(i));
+        expect(term.buffer.lines.get(1).loadCell(0, cell).getChars().length).eql(2);
+        expect(term.buffer.lines.get(1).loadCell(1, cell).getChars()).eql('');
         term.reset();
       }
     });
     it('2 characters per cell over line end without autowrap', () => {
-      let high = String.fromCharCode(0xD800);
+      const high = String.fromCharCode(0xD800);
+      const cell = new CellData();
       for (let i = 0xDC00; i <= 0xDCFF; ++i) {
         term.buffer.x = term.cols - 1;
         term.wraparoundMode = false;
         term.write('a' + high + String.fromCharCode(i));
         // auto wraparound mode should cut off the rest of the line
-        expect(term.buffer.lines.get(0)[term.cols - 1][CHAR_DATA_CHAR_INDEX]).eql('a');
-        expect(term.buffer.lines.get(0)[term.cols - 1][CHAR_DATA_CHAR_INDEX].length).eql(1);
-        expect(term.buffer.lines.get(1)[1][CHAR_DATA_CHAR_INDEX]).eql(' ');
+        expect(term.buffer.lines.get(0).loadCell(term.cols - 1, cell).getChars()).eql('a');
+        expect(term.buffer.lines.get(0).loadCell(term.cols - 1, cell).getChars().length).eql(1);
+        expect(term.buffer.lines.get(1).loadCell(1, cell).getChars()).eql('');
         term.reset();
       }
     });
     it('splitted surrogates', () => {
-      let high = String.fromCharCode(0xD800);
+      const high = String.fromCharCode(0xD800);
+      const cell = new CellData();
       for (let i = 0xDC00; i <= 0xDCFF; ++i) {
         term.write(high);
         term.write(String.fromCharCode(i));
-        let tchar = term.buffer.lines.get(0)[0];
-        expect(tchar[CHAR_DATA_CHAR_INDEX]).eql(high + String.fromCharCode(i));
-        expect(tchar[CHAR_DATA_CHAR_INDEX].length).eql(2);
-        expect(tchar[CHAR_DATA_WIDTH_INDEX]).eql(1);
-        expect(term.buffer.lines.get(0)[1][CHAR_DATA_CHAR_INDEX]).eql(' ');
+        const tchar = term.buffer.lines.get(0).loadCell(0, cell);
+        expect(tchar.getChars()).eql(high + String.fromCharCode(i));
+        expect(tchar.getChars().length).eql(2);
+        expect(tchar.getWidth()).eql(1);
+        expect(term.buffer.lines.get(0).loadCell(1, cell).getChars()).eql('');
         term.reset();
       }
     });
   });
 
   describe('unicode - combining characters', () => {
+    const cell = new CellData();
     it('café', () => {
       term.write('cafe\u0301');
-      expect(term.buffer.lines.get(0)[3][CHAR_DATA_CHAR_INDEX]).eql('e\u0301');
-      expect(term.buffer.lines.get(0)[3][CHAR_DATA_CHAR_INDEX].length).eql(2);
-      expect(term.buffer.lines.get(0)[3][CHAR_DATA_WIDTH_INDEX]).eql(1);
+      term.buffer.lines.get(0).loadCell(3, cell);
+      expect(cell.getChars()).eql('e\u0301');
+      expect(cell.getChars().length).eql(2);
+      expect(cell.getWidth()).eql(1);
     });
     it('café - end of line', () => {
       term.buffer.x = term.cols - 1 - 3;
       term.write('cafe\u0301');
-      expect(term.buffer.lines.get(0)[term.cols - 1][CHAR_DATA_CHAR_INDEX]).eql('e\u0301');
-      expect(term.buffer.lines.get(0)[term.cols - 1][CHAR_DATA_CHAR_INDEX].length).eql(2);
-      expect(term.buffer.lines.get(0)[term.cols - 1][CHAR_DATA_WIDTH_INDEX]).eql(1);
-      expect(term.buffer.lines.get(0)[1][CHAR_DATA_CHAR_INDEX]).eql(' ');
-      expect(term.buffer.lines.get(0)[1][CHAR_DATA_CHAR_INDEX].length).eql(1);
-      expect(term.buffer.lines.get(0)[1][CHAR_DATA_WIDTH_INDEX]).eql(1);
+      term.buffer.lines.get(0).loadCell(term.cols - 1, cell);
+      expect(cell.getChars()).eql('e\u0301');
+      expect(cell.getChars().length).eql(2);
+      expect(cell.getWidth()).eql(1);
+      term.buffer.lines.get(0).loadCell(1, cell);
+      expect(cell.getChars()).eql('');
+      expect(cell.getChars().length).eql(0);
+      expect(cell.getWidth()).eql(1);
     });
     it('multiple combined é', () => {
       term.wraparoundMode = true;
       term.write(Array(100).join('e\u0301'));
       for (let i = 0; i < term.cols; ++i) {
-        let tchar = term.buffer.lines.get(0)[i];
-        expect(tchar[CHAR_DATA_CHAR_INDEX]).eql('e\u0301');
-        expect(tchar[CHAR_DATA_CHAR_INDEX].length).eql(2);
-        expect(tchar[CHAR_DATA_WIDTH_INDEX]).eql(1);
+        term.buffer.lines.get(0).loadCell(i, cell);
+        expect(cell.getChars()).eql('e\u0301');
+        expect(cell.getChars().length).eql(2);
+        expect(cell.getWidth()).eql(1);
       }
-      let tchar = term.buffer.lines.get(1)[0];
-      expect(tchar[CHAR_DATA_CHAR_INDEX]).eql('e\u0301');
-      expect(tchar[CHAR_DATA_CHAR_INDEX].length).eql(2);
-      expect(tchar[CHAR_DATA_WIDTH_INDEX]).eql(1);
+      term.buffer.lines.get(1).loadCell(0, cell);
+      expect(cell.getChars()).eql('e\u0301');
+      expect(cell.getChars().length).eql(2);
+      expect(cell.getWidth()).eql(1);
     });
     it('multiple surrogate with combined', () => {
       term.wraparoundMode = true;
       term.write(Array(100).join('\uD800\uDC00\u0301'));
       for (let i = 0; i < term.cols; ++i) {
-        let tchar = term.buffer.lines.get(0)[i];
-        expect(tchar[CHAR_DATA_CHAR_INDEX]).eql('\uD800\uDC00\u0301');
-        expect(tchar[CHAR_DATA_CHAR_INDEX].length).eql(3);
-        expect(tchar[CHAR_DATA_WIDTH_INDEX]).eql(1);
+        term.buffer.lines.get(0).loadCell(i, cell);
+        expect(cell.getChars()).eql('\uD800\uDC00\u0301');
+        expect(cell.getChars().length).eql(3);
+        expect(cell.getWidth()).eql(1);
       }
-      let tchar = term.buffer.lines.get(1)[0];
-      expect(tchar[CHAR_DATA_CHAR_INDEX]).eql('\uD800\uDC00\u0301');
-      expect(tchar[CHAR_DATA_CHAR_INDEX].length).eql(3);
-      expect(tchar[CHAR_DATA_WIDTH_INDEX]).eql(1);
+      term.buffer.lines.get(1).loadCell(0, cell);
+      expect(cell.getChars()).eql('\uD800\uDC00\u0301');
+      expect(cell.getChars().length).eql(3);
+      expect(cell.getWidth()).eql(1);
     });
   });
 
   describe('unicode - fullwidth characters', () => {
+    const cell = new CellData();
     it('cursor movement even', () => {
       expect(term.buffer.x).eql(0);
       term.write('￥');
@@ -1021,140 +1014,141 @@ describe('term.js addons', () => {
       term.wraparoundMode = true;
       term.write(Array(50).join('￥'));
       for (let i = 0; i < term.cols; ++i) {
-        let tchar = term.buffer.lines.get(0)[i];
+        term.buffer.lines.get(0).loadCell(i, cell);
         if (i % 2) {
-          expect(tchar[CHAR_DATA_CHAR_INDEX]).eql('');
-          expect(tchar[CHAR_DATA_CHAR_INDEX].length).eql(0);
-          expect(tchar[CHAR_DATA_WIDTH_INDEX]).eql(0);
+          expect(cell.getChars()).eql('');
+          expect(cell.getChars().length).eql(0);
+          expect(cell.getWidth()).eql(0);
         } else {
-          expect(tchar[CHAR_DATA_CHAR_INDEX]).eql('￥');
-          expect(tchar[CHAR_DATA_CHAR_INDEX].length).eql(1);
-          expect(tchar[CHAR_DATA_WIDTH_INDEX]).eql(2);
+          expect(cell.getChars()).eql('￥');
+          expect(cell.getChars().length).eql(1);
+          expect(cell.getWidth()).eql(2);
         }
       }
-      let tchar = term.buffer.lines.get(1)[0];
-      expect(tchar[CHAR_DATA_CHAR_INDEX]).eql('￥');
-      expect(tchar[CHAR_DATA_CHAR_INDEX].length).eql(1);
-      expect(tchar[CHAR_DATA_WIDTH_INDEX]).eql(2);
+      term.buffer.lines.get(1).loadCell(0, cell);
+      expect(cell.getChars()).eql('￥');
+      expect(cell.getChars().length).eql(1);
+      expect(cell.getWidth()).eql(2);
     });
     it('line of ￥ odd', () => {
       term.wraparoundMode = true;
       term.buffer.x = 1;
       term.write(Array(50).join('￥'));
       for (let i = 1; i < term.cols - 1; ++i) {
-        let tchar = term.buffer.lines.get(0)[i];
+        term.buffer.lines.get(0).loadCell(i, cell);
         if (!(i % 2)) {
-          expect(tchar[CHAR_DATA_CHAR_INDEX]).eql('');
-          expect(tchar[CHAR_DATA_CHAR_INDEX].length).eql(0);
-          expect(tchar[CHAR_DATA_WIDTH_INDEX]).eql(0);
+          expect(cell.getChars()).eql('');
+          expect(cell.getChars().length).eql(0);
+          expect(cell.getWidth()).eql(0);
         } else {
-          expect(tchar[CHAR_DATA_CHAR_INDEX]).eql('￥');
-          expect(tchar[CHAR_DATA_CHAR_INDEX].length).eql(1);
-          expect(tchar[CHAR_DATA_WIDTH_INDEX]).eql(2);
+          expect(cell.getChars()).eql('￥');
+          expect(cell.getChars().length).eql(1);
+          expect(cell.getWidth()).eql(2);
         }
       }
-      let tchar = term.buffer.lines.get(0)[term.cols - 1];
-      expect(tchar[CHAR_DATA_CHAR_INDEX]).eql(' ');
-      expect(tchar[CHAR_DATA_CHAR_INDEX].length).eql(1);
-      expect(tchar[CHAR_DATA_WIDTH_INDEX]).eql(1);
-      tchar = term.buffer.lines.get(1)[0];
-      expect(tchar[CHAR_DATA_CHAR_INDEX]).eql('￥');
-      expect(tchar[CHAR_DATA_CHAR_INDEX].length).eql(1);
-      expect(tchar[CHAR_DATA_WIDTH_INDEX]).eql(2);
+      term.buffer.lines.get(0).loadCell(term.cols - 1, cell);
+      expect(cell.getChars()).eql('');
+      expect(cell.getChars().length).eql(0);
+      expect(cell.getWidth()).eql(1);
+      term.buffer.lines.get(1).loadCell(0, cell);
+      expect(cell.getChars()).eql('￥');
+      expect(cell.getChars().length).eql(1);
+      expect(cell.getWidth()).eql(2);
     });
     it('line of ￥ with combining odd', () => {
       term.wraparoundMode = true;
       term.buffer.x = 1;
       term.write(Array(50).join('￥\u0301'));
       for (let i = 1; i < term.cols - 1; ++i) {
-        let tchar = term.buffer.lines.get(0)[i];
+        term.buffer.lines.get(0).loadCell(i, cell);
         if (!(i % 2)) {
-          expect(tchar[CHAR_DATA_CHAR_INDEX]).eql('');
-          expect(tchar[CHAR_DATA_CHAR_INDEX].length).eql(0);
-          expect(tchar[CHAR_DATA_WIDTH_INDEX]).eql(0);
+          expect(cell.getChars()).eql('');
+          expect(cell.getChars().length).eql(0);
+          expect(cell.getWidth()).eql(0);
         } else {
-          expect(tchar[CHAR_DATA_CHAR_INDEX]).eql('￥\u0301');
-          expect(tchar[CHAR_DATA_CHAR_INDEX].length).eql(2);
-          expect(tchar[CHAR_DATA_WIDTH_INDEX]).eql(2);
+          expect(cell.getChars()).eql('￥\u0301');
+          expect(cell.getChars().length).eql(2);
+          expect(cell.getWidth()).eql(2);
         }
       }
-      let tchar = term.buffer.lines.get(0)[term.cols - 1];
-      expect(tchar[CHAR_DATA_CHAR_INDEX]).eql(' ');
-      expect(tchar[CHAR_DATA_CHAR_INDEX].length).eql(1);
-      expect(tchar[CHAR_DATA_WIDTH_INDEX]).eql(1);
-      tchar = term.buffer.lines.get(1)[0];
-      expect(tchar[CHAR_DATA_CHAR_INDEX]).eql('￥\u0301');
-      expect(tchar[CHAR_DATA_CHAR_INDEX].length).eql(2);
-      expect(tchar[CHAR_DATA_WIDTH_INDEX]).eql(2);
+      term.buffer.lines.get(0).loadCell(term.cols - 1, cell);
+      expect(cell.getChars()).eql('');
+      expect(cell.getChars().length).eql(0);
+      expect(cell.getWidth()).eql(1);
+      term.buffer.lines.get(1).loadCell(0, cell);
+      expect(cell.getChars()).eql('￥\u0301');
+      expect(cell.getChars().length).eql(2);
+      expect(cell.getWidth()).eql(2);
     });
     it('line of ￥ with combining even', () => {
       term.wraparoundMode = true;
       term.write(Array(50).join('￥\u0301'));
       for (let i = 0; i < term.cols; ++i) {
-        let tchar = term.buffer.lines.get(0)[i];
+        term.buffer.lines.get(0).loadCell(i, cell);
         if (i % 2) {
-          expect(tchar[CHAR_DATA_CHAR_INDEX]).eql('');
-          expect(tchar[CHAR_DATA_CHAR_INDEX].length).eql(0);
-          expect(tchar[CHAR_DATA_WIDTH_INDEX]).eql(0);
+          expect(cell.getChars()).eql('');
+          expect(cell.getChars().length).eql(0);
+          expect(cell.getWidth()).eql(0);
         } else {
-          expect(tchar[CHAR_DATA_CHAR_INDEX]).eql('￥\u0301');
-          expect(tchar[CHAR_DATA_CHAR_INDEX].length).eql(2);
-          expect(tchar[CHAR_DATA_WIDTH_INDEX]).eql(2);
+          expect(cell.getChars()).eql('￥\u0301');
+          expect(cell.getChars().length).eql(2);
+          expect(cell.getWidth()).eql(2);
         }
       }
-      let tchar = term.buffer.lines.get(1)[0];
-      expect(tchar[CHAR_DATA_CHAR_INDEX]).eql('￥\u0301');
-      expect(tchar[CHAR_DATA_CHAR_INDEX].length).eql(2);
-      expect(tchar[CHAR_DATA_WIDTH_INDEX]).eql(2);
+      term.buffer.lines.get(1).loadCell(0, cell);
+      expect(cell.getChars()).eql('￥\u0301');
+      expect(cell.getChars().length).eql(2);
+      expect(cell.getWidth()).eql(2);
     });
     it('line of surrogate fullwidth with combining odd', () => {
       term.wraparoundMode = true;
       term.buffer.x = 1;
       term.write(Array(50).join('\ud843\ude6d\u0301'));
       for (let i = 1; i < term.cols - 1; ++i) {
-        let tchar = term.buffer.lines.get(0)[i];
+        term.buffer.lines.get(0).loadCell(i, cell);
         if (!(i % 2)) {
-          expect(tchar[CHAR_DATA_CHAR_INDEX]).eql('');
-          expect(tchar[CHAR_DATA_CHAR_INDEX].length).eql(0);
-          expect(tchar[CHAR_DATA_WIDTH_INDEX]).eql(0);
+          expect(cell.getChars()).eql('');
+          expect(cell.getChars().length).eql(0);
+          expect(cell.getWidth()).eql(0);
         } else {
-          expect(tchar[CHAR_DATA_CHAR_INDEX]).eql('\ud843\ude6d\u0301');
-          expect(tchar[CHAR_DATA_CHAR_INDEX].length).eql(3);
-          expect(tchar[CHAR_DATA_WIDTH_INDEX]).eql(2);
+          expect(cell.getChars()).eql('\ud843\ude6d\u0301');
+          expect(cell.getChars().length).eql(3);
+          expect(cell.getWidth()).eql(2);
         }
       }
-      let tchar = term.buffer.lines.get(0)[term.cols - 1];
-      expect(tchar[CHAR_DATA_CHAR_INDEX]).eql(' ');
-      expect(tchar[CHAR_DATA_CHAR_INDEX].length).eql(1);
-      expect(tchar[CHAR_DATA_WIDTH_INDEX]).eql(1);
-      tchar = term.buffer.lines.get(1)[0];
-      expect(tchar[CHAR_DATA_CHAR_INDEX]).eql('\ud843\ude6d\u0301');
-      expect(tchar[CHAR_DATA_CHAR_INDEX].length).eql(3);
-      expect(tchar[CHAR_DATA_WIDTH_INDEX]).eql(2);
+      term.buffer.lines.get(0).loadCell(term.cols - 1, cell);
+      expect(cell.getChars()).eql('');
+      expect(cell.getChars().length).eql(0);
+      expect(cell.getWidth()).eql(1);
+      term.buffer.lines.get(1).loadCell(0, cell);
+      expect(cell.getChars()).eql('\ud843\ude6d\u0301');
+      expect(cell.getChars().length).eql(3);
+      expect(cell.getWidth()).eql(2);
     });
     it('line of surrogate fullwidth with combining even', () => {
       term.wraparoundMode = true;
       term.write(Array(50).join('\ud843\ude6d\u0301'));
       for (let i = 0; i < term.cols; ++i) {
-        let tchar = term.buffer.lines.get(0)[i];
+        term.buffer.lines.get(0).loadCell(i, cell);
         if (i % 2) {
-          expect(tchar[CHAR_DATA_CHAR_INDEX]).eql('');
-          expect(tchar[CHAR_DATA_CHAR_INDEX].length).eql(0);
-          expect(tchar[CHAR_DATA_WIDTH_INDEX]).eql(0);
+          expect(cell.getChars()).eql('');
+          expect(cell.getChars().length).eql(0);
+          expect(cell.getWidth()).eql(0);
         } else {
-          expect(tchar[CHAR_DATA_CHAR_INDEX]).eql('\ud843\ude6d\u0301');
-          expect(tchar[CHAR_DATA_CHAR_INDEX].length).eql(3);
-          expect(tchar[CHAR_DATA_WIDTH_INDEX]).eql(2);
+          expect(cell.getChars()).eql('\ud843\ude6d\u0301');
+          expect(cell.getChars().length).eql(3);
+          expect(cell.getWidth()).eql(2);
         }
       }
-      let tchar = term.buffer.lines.get(1)[0];
-      expect(tchar[CHAR_DATA_CHAR_INDEX]).eql('\ud843\ude6d\u0301');
-      expect(tchar[CHAR_DATA_CHAR_INDEX].length).eql(3);
-      expect(tchar[CHAR_DATA_WIDTH_INDEX]).eql(2);
+      term.buffer.lines.get(1).loadCell(0, cell);
+      expect(cell.getChars()).eql('\ud843\ude6d\u0301');
+      expect(cell.getChars().length).eql(3);
+      expect(cell.getWidth()).eql(2);
     });
   });
 
   describe('insert mode', () => {
+    const cell = new CellData();
     it('halfwidth - all', () => {
       term.write(Array(9).join('0123456789').slice(-80));
       term.buffer.x = 10;
@@ -1162,10 +1156,10 @@ describe('term.js addons', () => {
       term.insertMode = true;
       term.write('abcde');
       expect(term.buffer.lines.get(0).length).eql(term.cols);
-      expect(term.buffer.lines.get(0)[10][CHAR_DATA_CHAR_INDEX]).eql('a');
-      expect(term.buffer.lines.get(0)[14][CHAR_DATA_CHAR_INDEX]).eql('e');
-      expect(term.buffer.lines.get(0)[15][CHAR_DATA_CHAR_INDEX]).eql('0');
-      expect(term.buffer.lines.get(0)[79][CHAR_DATA_CHAR_INDEX]).eql('4');
+      expect(term.buffer.lines.get(0).loadCell(10, cell).getChars()).eql('a');
+      expect(term.buffer.lines.get(0).loadCell(14, cell).getChars()).eql('e');
+      expect(term.buffer.lines.get(0).loadCell(15, cell).getChars()).eql('0');
+      expect(term.buffer.lines.get(0).loadCell(79, cell).getChars()).eql('4');
     });
     it('fullwidth - insert', () => {
       term.write(Array(9).join('0123456789').slice(-80));
@@ -1174,11 +1168,11 @@ describe('term.js addons', () => {
       term.insertMode = true;
       term.write('￥￥￥');
       expect(term.buffer.lines.get(0).length).eql(term.cols);
-      expect(term.buffer.lines.get(0)[10][CHAR_DATA_CHAR_INDEX]).eql('￥');
-      expect(term.buffer.lines.get(0)[11][CHAR_DATA_CHAR_INDEX]).eql('');
-      expect(term.buffer.lines.get(0)[14][CHAR_DATA_CHAR_INDEX]).eql('￥');
-      expect(term.buffer.lines.get(0)[15][CHAR_DATA_CHAR_INDEX]).eql('');
-      expect(term.buffer.lines.get(0)[79][CHAR_DATA_CHAR_INDEX]).eql('3');
+      expect(term.buffer.lines.get(0).loadCell(10, cell).getChars()).eql('￥');
+      expect(term.buffer.lines.get(0).loadCell(11, cell).getChars()).eql('');
+      expect(term.buffer.lines.get(0).loadCell(14, cell).getChars()).eql('￥');
+      expect(term.buffer.lines.get(0).loadCell(15, cell).getChars()).eql('');
+      expect(term.buffer.lines.get(0).loadCell(79, cell).getChars()).eql('3');
     });
     it('fullwidth - right border', () => {
       term.write(Array(41).join('￥'));
@@ -1187,14 +1181,14 @@ describe('term.js addons', () => {
       term.insertMode = true;
       term.write('a');
       expect(term.buffer.lines.get(0).length).eql(term.cols);
-      expect(term.buffer.lines.get(0)[10][CHAR_DATA_CHAR_INDEX]).eql('a');
-      expect(term.buffer.lines.get(0)[11][CHAR_DATA_CHAR_INDEX]).eql('￥');
-      expect(term.buffer.lines.get(0)[79][CHAR_DATA_CHAR_INDEX]).eql(' ');  // fullwidth char got replaced
+      expect(term.buffer.lines.get(0).loadCell(10, cell).getChars()).eql('a');
+      expect(term.buffer.lines.get(0).loadCell(11, cell).getChars()).eql('￥');
+      expect(term.buffer.lines.get(0).loadCell(79, cell).getChars()).eql('');  // fullwidth char got replaced
       term.write('b');
       expect(term.buffer.lines.get(0).length).eql(term.cols);
-      expect(term.buffer.lines.get(0)[11][CHAR_DATA_CHAR_INDEX]).eql('b');
-      expect(term.buffer.lines.get(0)[12][CHAR_DATA_CHAR_INDEX]).eql('￥');
-      expect(term.buffer.lines.get(0)[79][CHAR_DATA_CHAR_INDEX]).eql('');  // empty cell after fullwidth
+      expect(term.buffer.lines.get(0).loadCell(11, cell).getChars()).eql('b');
+      expect(term.buffer.lines.get(0).loadCell(12, cell).getChars()).eql('￥');
+      expect(term.buffer.lines.get(0).loadCell(79, cell).getChars()).eql('');  // empty cell after fullwidth
     });
   });
 });

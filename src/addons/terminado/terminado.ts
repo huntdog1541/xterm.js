@@ -6,8 +6,6 @@
  * WebSocket stream.
  */
 
-/// <reference path="../../../typings/xterm.d.ts"/>
-
 import { Terminal } from 'xterm';
 import { ITerminadoAddonTerminal } from './Interfaces';
 
@@ -61,9 +59,9 @@ export function terminadoAttach(term: Terminal, socket: WebSocket, bidirectional
   socket.addEventListener('message', addonTerminal.__getMessage);
 
   if (bidirectional) {
-    addonTerminal.on('data', addonTerminal.__sendData);
+    addonTerminal._core.register(addonTerminal.onData(addonTerminal.__sendData));
   }
-  addonTerminal.on('resize', addonTerminal.__setSize);
+  addonTerminal._core.register(addonTerminal.onResize(addonTerminal.__setSize));
 
   socket.addEventListener('close', () => terminadoDetach(addonTerminal, socket));
   socket.addEventListener('error', () => terminadoDetach(addonTerminal, socket));
@@ -77,7 +75,8 @@ export function terminadoAttach(term: Terminal, socket: WebSocket, bidirectional
  */
 export function terminadoDetach(term: Terminal, socket: WebSocket): void {
   const addonTerminal = <ITerminadoAddonTerminal>term;
-  addonTerminal.off('data', addonTerminal.__sendData);
+  addonTerminal.__dataListener.dispose();
+  addonTerminal.__dataListener = undefined;
 
   socket = (typeof socket === 'undefined') ? addonTerminal.__socket : socket;
 
